@@ -1,0 +1,12 @@
+services:
+  mediamtx:
+    image: bluenviron/mediamtx:1.9.3
+    container_name: mediamtx
+    network_mode: host
+    volumes:
+      - ./mediamtx.yml:/mediamtx.yml
+    logging:
+      options:
+        max-size: "1M"
+    tty: true
+    restart: always
