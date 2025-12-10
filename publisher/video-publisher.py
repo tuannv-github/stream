@@ -301,12 +301,12 @@ def main():
         epilog="""
 Examples:
   %(prog)s -l                    # List available video devices
-  %(prog)s                       # Stream from /dev/video4 with UYVY@1280x720 to /stream/go2/front (UDP)
+  %(prog)s                       # Stream from /dev/video4 with UYVY@1280x720 to /stream/go2/front (RTMP)
   %(prog)s -d /dev/video1        # Stream from /dev/video1
-  %(prog)s -s 192.168.1.100 -p 8000  # Stream to custom server
+  %(prog)s -s 192.168.1.100 -p 1935  # Stream to custom server
   %(prog)s -f YUYV -r 1280x720   # Use YUYV format at 1280x720 resolution
   %(prog)s -t /stream/go2/back   # Stream to different topic
-  %(prog)s --protocol rtmp -p 1935  # Stream via RTMP on port 1935
+  %(prog)s --protocol udp -p 8000  # Stream via UDP on port 8000
         """
     )
     
@@ -331,8 +331,8 @@ Examples:
     parser.add_argument(
         '-p', '--port',
         type=int,
-        default=8000,
-        help='MediaMTX server port (UDP: 8000, RTMP: 1935) (default: 8000)'
+        default=1935,
+        help='MediaMTX server port (UDP: 8000, RTMP: 1935) (default: 1935)'
     )
     
     parser.add_argument(
@@ -356,8 +356,8 @@ Examples:
     parser.add_argument(
         '--protocol',
         choices=['udp', 'rtmp'],
-        default='udp',
-        help='Streaming protocol: udp (UDP RTP) or rtmp (RTMP) (default: udp)'
+        default='rtmp',
+        help='Streaming protocol: udp (UDP RTP) or rtmp (RTMP) (default: rtmp)'
     )
     
     args = parser.parse_args()
@@ -382,10 +382,13 @@ Examples:
         print("Run: ./install-gst.sh")
         sys.exit(1)
     
-    # Adjust default port based on protocol
+    # Adjust port based on protocol if user specified wrong default
     if args.protocol == 'rtmp' and args.port == 8000:
         # RTMP default port is 1935
         args.port = 1935
+    elif args.protocol == 'udp' and args.port == 1935:
+        # UDP default port is 8000
+        args.port = 8000
     
     # Build and print pipeline
     pipeline = build_gstreamer_pipeline(
