@@ -1,3 +1,5 @@
+#! /usr/bin/env python3
+
 import sys
 from PyQt5.QtCore import *
 from PyQt5.QtGui import *
@@ -6,6 +8,10 @@ import time
 from PyQt5.uic import loadUi
 import threading
 from enum import Enum
+import json
+import os
+import shutil
+from pathlib import Path
 
 import sys
 from PyQt5.QtCore import Qt
@@ -15,12 +21,11 @@ gi.require_version('Gst', '1.0')
 gi.require_version('GstVideo', '1.0')
 from gi.repository import Gst, GObject, GstVideo
 
-URLs = [
-    {
-        "url": "rtsp://10.1.101.210:8554/live/stream/kobuki",
-        "name": "Stream Kuboki",
-    },
-]
+CONFIG_FILE = os.path.join(os.path.dirname(__file__), "stream_subscriber.conf")
+DEFAULT_CONFIG_FILE = os.path.join(os.path.dirname(__file__), "stream_subscriber.default.conf")
+
+# Global URLs variable - will be initialized from config
+URLs = []
 
 FONT_SIZE_PIXELS = 0
 
@@ -83,6 +88,23 @@ class Video(QOpenGLWidget):
                 sink_pad = rtph264depay.get_static_pad("sink")
                 pad.link(sink_pad)
         self.source.connect("pad-added", on_pad_added)
+        
+        # Print pipeline structure
+        print("\n" + "="*80)
+        print("GStreamer Pipeline:")
+        print("="*80)
+        print(f"Pipeline: {self.pipeline.get_name()}")
+        elements = []
+        it = self.pipeline.iterate_elements()
+        while True:
+            result, element = it.next()
+            if result == Gst.IteratorResult.DONE:
+                break
+            if result == Gst.IteratorResult.OK:
+                elements.append(element.get_name())
+        print(f"Elements: {' -> '.join(elements)}")
+        print(f"Pipeline description: rtspsrc -> rtph264depay -> h264parse -> avdec_h264 -> videoconvert -> glimagesink")
+        print("="*80 + "\n")
 
     def open_stream(self, URL_index, max_tries=None):
         if self.state == VideoState.STATE_OPEN:
@@ -189,10 +211,80 @@ class Video(QOpenGLWidget):
     def closeEvent(self, event):
         self.close_stream()
 
+def load_settings():
+    """Load settings from configuration file."""
+    # Copy default config if config file doesn't exist
+    if not os.path.exists(CONFIG_FILE) and os.path.exists(DEFAULT_CONFIG_FILE):
+        try:
+            shutil.copy2(DEFAULT_CONFIG_FILE, CONFIG_FILE)
+            print(f"Created {CONFIG_FILE} from {DEFAULT_CONFIG_FILE}")
+        except IOError as e:
+            print(f"Error copying default config file: {e}")
+    
+    # Load defaults from default config file
+    default_settings = None
+    if os.path.exists(DEFAULT_CONFIG_FILE):
+        try:
+            with open(DEFAULT_CONFIG_FILE, 'r') as f:
+                default_settings = json.load(f)
+        except (json.JSONDecodeError, IOError) as e:
+            print(f"Error loading default config file: {e}")
+    
+    # Fallback defaults if default config file doesn't exist or is invalid
+    if default_settings is None:
+        default_settings = {
+            "urls": [],
+            "url_index": 0,
+            "window_x": None,
+            "window_y": None,
+            "window_width": None,
+            "window_height": None
+        }
+    
+    # Load actual config file
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, 'r') as f:
+                settings = json.load(f)
+                # Merge with defaults to ensure all keys exist
+                for key in default_settings:
+                    if key not in settings:
+                        settings[key] = default_settings[key]
+                # Validate URLs structure
+                if "urls" in settings and isinstance(settings["urls"], list):
+                    # Ensure each URL has required fields
+                    valid_urls = []
+                    for url_item in settings["urls"]:
+                        if isinstance(url_item, dict) and "url" in url_item and "name" in url_item:
+                            valid_urls.append(url_item)
+                    if valid_urls:
+                        settings["urls"] = valid_urls
+                    else:
+                        settings["urls"] = default_settings.get("urls", [])
+                else:
+                    settings["urls"] = default_settings.get("urls", [])
+                return settings
+        except (json.JSONDecodeError, IOError) as e:
+            print(f"Error loading config file: {e}. Using defaults.")
+            return default_settings
+    
+    return default_settings
+
+def save_settings(settings):
+    """Save settings to configuration file."""
+    try:
+        with open(CONFIG_FILE, 'w') as f:
+            json.dump(settings, f, indent=4)
+    except IOError as e:
+        print(f"Error saving config file: {e}")
+
 class Open(QWidget):
-    def __init__(self):
+    def __init__(self, initial_url_index=0, urls_list=None):
         super().__init__()
         loadUi("ui/Open.ui", self)
+        
+        if urls_list is None:
+            urls_list = URLs
 
         # palette = self.palette()
         # palette.setColor(QPalette.Window, QColor(0, 255, 0))  # RGB color
@@ -200,8 +292,15 @@ class Open(QWidget):
         # self.setAutoFillBackground(True)  # Required for palette to take effect
 
         comboBox_URL = self.findChild(QComboBox, "comboBox_URL")
-        comboBox_URL.addItems([url["name"] for url in URLs])
-        comboBox_URL.setCurrentIndex(0)
+        comboBox_URL.addItems([url["name"] for url in urls_list])
+        comboBox_URL.setCurrentIndex(initial_url_index)
+        comboBox_URL.currentIndexChanged.connect(self.on_url_changed)
+    
+    def on_url_changed(self, index):
+        """Save URL index when changed."""
+        settings = load_settings()
+        settings["url_index"] = index
+        save_settings(settings)
         
 
     def resizeEvent(self, event):
@@ -230,9 +329,13 @@ class Open(QWidget):
             pushButton_Open.setText("Connecting...")
 
 class Player(QWidget):
-    def __init__(self):
+    def __init__(self, initial_url_index=0, urls_list=None):
         super().__init__()
         loadUi("ui/Player.ui", self)
+        
+        if urls_list is None:
+            urls_list = URLs
+        self.urls_list = urls_list
 
         # palette = self.palette()
         # palette.setColor(QPalette.Window, QColor(100, 150, 200))  # RGB color
@@ -242,7 +345,7 @@ class Player(QWidget):
         layout = QVBoxLayout()
         self.setLayout(layout)
 
-        self.widgetOpen = Open()
+        self.widgetOpen = Open(initial_url_index, urls_list)
         self.layout().addWidget(self.widgetOpen)
 
         self.widgetVideo = Video()
@@ -260,7 +363,7 @@ class Player(QWidget):
         else:
             comboBox_URL = self.widgetOpen.findChild(QComboBox, "comboBox_URL")
             index = comboBox_URL.currentIndex()
-            url = URLs[index]
+            url = self.urls_list[index]
             self.widgetVideo.open_stream(index)
 
     def resizeEvent(self, event):
@@ -277,7 +380,12 @@ class MainWindow(QMainWindow):
         super().__init__()
         loadUi("ui/Live.ui", self)
 
-        self.player0 = Player()
+        # Load settings
+        settings = load_settings()
+        url_index = settings.get("url_index", 0)
+        
+        # Use global URLs (already loaded in main)
+        self.player0 = Player(url_index, URLs)
         self.layout().addWidget(self.player0)
 
         # self.player1 = Player()
@@ -286,6 +394,29 @@ class MainWindow(QMainWindow):
         self.statusBar().setStyleSheet("background-color: white;")
         self.show_status_bar("Ready")
         
+        # Apply saved window geometry or use defaults
+        saved_x = settings.get("window_x")
+        saved_y = settings.get("window_y")
+        saved_width = settings.get("window_width")
+        saved_height = settings.get("window_height")
+        
+        if (saved_x is not None and saved_y is not None and 
+            saved_width is not None and saved_height is not None):
+            # Validate that the saved geometry is on a valid screen
+            screen_geometry = QDesktopWidget().availableGeometry()
+            if (0 <= saved_x < screen_geometry.width() and 
+                0 <= saved_y < screen_geometry.height() and
+                saved_width > 0 and saved_height > 0):
+                self.setGeometry(saved_x, saved_y, saved_width, saved_height)
+            else:
+                # Use default centered geometry if saved geometry is invalid
+                self._set_default_geometry()
+        else:
+            # Use default centered geometry if no saved geometry
+            self._set_default_geometry()
+    
+    def _set_default_geometry(self):
+        """Set default centered window geometry."""
         screen_geometry = QDesktopWidget().availableGeometry()
         screen_center_x = screen_geometry.width() // 2
         screen_center_y = screen_geometry.height() // 2
@@ -297,6 +428,19 @@ class MainWindow(QMainWindow):
             window_width,
             window_height
         )
+    
+    def closeEvent(self, event):
+        """Save settings when window is closed."""
+        settings = load_settings()
+        geometry = self.geometry()
+        settings["window_x"] = geometry.x()
+        settings["window_y"] = geometry.y()
+        settings["window_width"] = geometry.width()
+        settings["window_height"] = geometry.height()
+        # Save current URLs
+        settings["urls"] = URLs
+        save_settings(settings)
+        event.accept()
 
     def resizeEvent(self, event):
         print(f"MainWindow resized to: {event.size().width()}x{event.size().height()}")
@@ -316,6 +460,13 @@ if __name__ == '__main__':
 
     FONT_SIZE_PIXELS = int(QWidget().font().pointSize() * app.primaryScreen().logicalDotsPerInch() / 72.0)
     print(f"FONT_SIZE_PIXELS: {FONT_SIZE_PIXELS}")
+    
+    # Load settings and initialize global URLs
+    # load_settings() will automatically copy from default config if needed
+    settings = load_settings()
+    # Update the global URLs list
+    URLs.clear()
+    URLs.extend(settings.get("urls", []))
     
     window = MainWindow()
     window.show()
