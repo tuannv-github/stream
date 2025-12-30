@@ -2,3 +2,5 @@ build
 dist
 *.spec
 stream_subscriber.conf
+recordings/
+*.log
