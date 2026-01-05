@@ -324,8 +324,8 @@ Examples:
     
     parser.add_argument(
         '-s', '--server',
-        default='10.1.101.210',
-        help='MediaMTX server IP address (default: 10.1.101.210)'
+        default='129.126.114.218',
+        help='MediaMTX server IP address (default:129.126.114.218)'
     )
     
     parser.add_argument(
