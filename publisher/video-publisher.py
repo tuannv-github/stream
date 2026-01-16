@@ -8,6 +8,7 @@ import subprocess
 import sys
 import os
 import signal
+import time
 
 
 def get_device_formats(device):
@@ -422,21 +423,23 @@ Examples:
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
     
-    # Run GStreamer pipeline
-    try:
-        # gst-launch-1.0 expects the pipeline as a single string
-        cmd = ['gst-launch-1.0'] + pipeline.split()
-        print(f"Running: gst-launch-1.0 {pipeline}\n")
-        subprocess.run(cmd, check=True)
-    except KeyboardInterrupt:
-        print("\nStopping stream...")
-        sys.exit(0)
-    except subprocess.CalledProcessError as e:
-        print(f"\nError running GStreamer pipeline: {e}")
-        sys.exit(1)
-    except Exception as e:
-        print(f"\nUnexpected error: {e}")
-        sys.exit(1)
+    restart_count = 0   
+    while True:
+        # Run GStreamer pipeline
+        try:
+            # gst-launch-1.0 expects the pipeline as a single string
+            cmd = ['gst-launch-1.0'] + pipeline.split()
+            print(f"Running: gst-launch-1.0 {pipeline}\n")
+            subprocess.run(cmd, check=True)
+        except KeyboardInterrupt:
+            print("\nStopping stream...")
+        except subprocess.CalledProcessError as e:
+            print(f"\nError running GStreamer pipeline: {e}")
+        except Exception as e:
+            print(f"\nUnexpected error: {e}")
+        restart_count += 1
+        print(f"Restarting stream... (attempt {restart_count})")
+        time.sleep(1)
 
 
 if __name__ == '__main__':
