@@ -4,3 +4,4 @@ dist
 stream_subscriber.conf
 recordings/
 *.log*
+__pycache__/

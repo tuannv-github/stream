@@ -24,6 +24,16 @@ gi.require_version('Gst', '1.0')
 gi.require_version('GstVideo', '1.0')
 from gi.repository import Gst, GObject, GstVideo
 
+# InfluxDB client
+try:
+    from influxdb_client import InfluxDBClient, Point
+    from influxdb_client.client.write_api import SYNCHRONOUS
+    INFLUXDB_AVAILABLE = True
+except ImportError:
+    INFLUXDB_AVAILABLE = False
+    logger_temp = logging.getLogger(__name__)
+    logger_temp.warning("influxdb-client not installed. Install with: pip install influxdb-client")
+
 CONFIG_FILE = os.path.join(os.path.dirname(__file__), "stream_subscriber.conf")
 DEFAULT_CONFIG_FILE = os.path.join(os.path.dirname(__file__), "stream_subscriber.default.conf")
 LOG_FILE = os.path.join(os.path.dirname(__file__), "stream_subscriber.log")
@@ -81,6 +91,17 @@ logger = setup_logging()
 URLs = []
 
 FONT_SIZE_PIXELS = 0
+
+# FPS calculation constants
+FPS_DURATION = 0.5  # Calculate FPS every 0.5 seconds
+FPS_MOVING_AVERAGE_WINDOW = 10
+
+# InfluxDB constants
+INFLUXDB_URL = "http://localhost:8086"
+INFLUXDB_ORG = "fcclab"
+INFLUXDB_BUCKET = "fcclab"
+INFLUXDB_TOKEN = "fcclab_token"
+INFLUXDB_MEASUREMENT = "stream_metrics"  # Measurement name in InfluxDB
 
 class VideoState(Enum):
     STATE_CLOSE = 0
@@ -171,6 +192,19 @@ class Video(QOpenGLWidget):
         decoder.link(convert)
         convert.link(sink)
         
+        # Add probe to count frames for FPS calculation
+        sink_pad = convert.get_static_pad("sink")
+        if sink_pad:
+            def frame_probe_callback(pad, info):
+                """Callback function to count frames."""
+                self.increment_frame_count()
+                return Gst.PadProbeReturn.OK
+            
+            sink_pad.add_probe(Gst.PadProbeType.BUFFER, frame_probe_callback)
+            logger.debug("Added frame counting probe to convert element sink pad")
+        else:
+            logger.warning("Could not get sink pad for frame counting probe")
+        
         # Recording elements (will be added when recording starts)
         self.recording_queue = None
         self.recording_h264parse = None
@@ -243,6 +277,29 @@ class Video(QOpenGLWidget):
             logger.debug(f"Pipeline set_state(NULL) returned: {ret}")
             self.__change_state(VideoState.STATE_CLOSE)
             logger.info("Stream closed successfully")
+    
+    def calculate_fps(self):
+        """Calculate FPS every FPS_DURATION seconds and update current_fps."""
+        current_time = time.time()
+        elapsed_time = current_time - self.fps_last_time
+        
+        if elapsed_time >= FPS_DURATION:
+            # Calculate FPS
+            self.current_fps = self.frame_count / elapsed_time
+            logger.debug(f"FPS: {self.current_fps:.2f} (frames: {self.frame_count}, time: {elapsed_time:.2f}s)")
+            
+            # Reset counters
+            self.frame_count = 0
+            self.fps_last_time = current_time
+    
+    def increment_frame_count(self):
+        """Increment frame count and calculate FPS."""
+        self.frame_count += 1
+        self.calculate_fps()
+    
+    def get_fps(self):
+        """Get the current FPS value."""
+        return self.current_fps
     
     def _handle_disconnect_with_recording(self):
         """Handle disconnect when recording is active - stop and save recording, set auto-restart flag."""
@@ -1023,6 +1080,11 @@ class Video(QOpenGLWidget):
         self.__create_pipeline()
         self.__change_state(VideoState.STATE_CLOSE)
 
+        # Initialize FPS tracking
+        self.frame_count = 0
+        self.fps_last_time = time.time()
+        self.current_fps = 0.0
+
         # Connect signal for auto-starting recording (signal is thread-safe)
         self.sig_auto_start_recording.connect(self._auto_start_recording_after_reconnect)
 
@@ -1353,6 +1415,16 @@ class Open(QWidget):
         self.pushButton_Record = QPushButton("Record", self)
         self.pushButton_Record.setEnabled(False)  # Disabled until stream is open
         self.pushButton_Record.clicked.connect(self.on_record_button_clicked)
+
+        # Add publish button
+        self.pushButton_Publish = QPushButton("Publish to DB", self)
+        self.pushButton_Publish.setEnabled(False)  # Disabled until InfluxDB is connected
+        self.pushButton_Publish.clicked.connect(self.on_publish_button_clicked)
+
+        # Add FPS label
+        self.label_FPS = QLabel("FPS: 0.0", self)
+        self.label_FPS.setStyleSheet("color: green; font-weight: bold;")
+
     
     def on_url_changed(self, index):
         """Save URL index when changed."""
@@ -1366,15 +1438,23 @@ class Open(QWidget):
         comboBox_URL = self.findChild(QComboBox, "comboBox_URL")
         pushButton_Open = self.findChild(QPushButton, "pushButton_Open")
         line_Open = self.findChild(QFrame, "line_Open")
-        pushButton_Open.setGeometry(FONT_SIZE_PIXELS, int(event.size().height()/2 - FONT_SIZE_PIXELS*1.2), FONT_SIZE_PIXELS * 10, FONT_SIZE_PIXELS * 2)
+        pushButton_Open.setGeometry(FONT_SIZE_PIXELS, int(event.size().height()/2 - FONT_SIZE_PIXELS*1.2), FONT_SIZE_PIXELS * 8, FONT_SIZE_PIXELS * 2)
         # Position record button next to Open button
-        self.pushButton_Record.setGeometry(pushButton_Open.x() + pushButton_Open.width() + FONT_SIZE_PIXELS, int(event.size().height()/2 - FONT_SIZE_PIXELS*1.2), FONT_SIZE_PIXELS * 10, FONT_SIZE_PIXELS * 2)
-        # Adjust combo box to account for record button
-        comboBox_URL.setGeometry(self.pushButton_Record.x() + self.pushButton_Record.width() + FONT_SIZE_PIXELS, int(event.size().height()/2 - FONT_SIZE_PIXELS*1.2), event.size().width() - self.pushButton_Record.x() - self.pushButton_Record.width() - FONT_SIZE_PIXELS*3, FONT_SIZE_PIXELS * 2)
+        self.pushButton_Record.setGeometry(pushButton_Open.x() + pushButton_Open.width() + FONT_SIZE_PIXELS, int(event.size().height()/2 - FONT_SIZE_PIXELS*1.2), FONT_SIZE_PIXELS * 8, FONT_SIZE_PIXELS * 2)
+        # Position publish button next to Record button
+        self.pushButton_Publish.setGeometry(self.pushButton_Record.x() + self.pushButton_Record.width() + FONT_SIZE_PIXELS, int(event.size().height()/2 - FONT_SIZE_PIXELS*1.2), FONT_SIZE_PIXELS * 10, FONT_SIZE_PIXELS * 2)
+        # Position FPS label after Publish button
+        self.label_FPS.setGeometry(self.pushButton_Publish.x() + self.pushButton_Publish.width() + FONT_SIZE_PIXELS, int(event.size().height()/2 - FONT_SIZE_PIXELS*1.2), FONT_SIZE_PIXELS * 6, FONT_SIZE_PIXELS * 2)
+        # Adjust combo box to account for all buttons and FPS label
+        comboBox_URL.setGeometry(self.label_FPS.x() + self.label_FPS.width() + FONT_SIZE_PIXELS, int(event.size().height()/2 - FONT_SIZE_PIXELS*1.2), event.size().width() - self.label_FPS.x() - self.label_FPS.width() - FONT_SIZE_PIXELS*2, FONT_SIZE_PIXELS * 2)
         line_Open.setGeometry(0, int(event.size().height() - FONT_SIZE_PIXELS), event.size().width(), line_Open.height())
     
     def on_record_button_clicked(self):
         """Handle record button click - will be connected to Video widget."""
+        pass  # This will be handled by the Player class
+
+    def on_publish_button_clicked(self):
+        """Handle publish button click - will be connected to Player widget."""
         pass  # This will be handled by the Player class
 
     def sig_state_changed(self, state):
@@ -1447,9 +1527,97 @@ class Player(QWidget):
         
         # Connect record button
         self.widgetOpen.pushButton_Record.clicked.connect(self.on_record_button_clicked)
+
+        # Connect publish button
+        self.widgetOpen.pushButton_Publish.clicked.connect(self.on_publish_button_clicked)
         
         self.widgetVideo.sig_state_changed.connect(self.widgetOpen.sig_state_changed)
         self.widgetVideo.sig_recording_changed.connect(self.widgetOpen.sig_recording_changed)
+        
+        # Initialize FPS moving average tracking
+        self.fps_history = []  # List to store recent FPS values
+        self.moving_average_fps = 0.0  # Moving average FPS
+        
+        # Setup InfluxDB client
+        self.influxdb_client = None
+        self.write_api = None
+        if INFLUXDB_AVAILABLE:
+            try:
+                self.influxdb_client = InfluxDBClient(
+                    url=INFLUXDB_URL,
+                    token=INFLUXDB_TOKEN,
+                    org=INFLUXDB_ORG
+                )
+                self.write_api = self.influxdb_client.write_api(write_precision="s")
+                logger.info(f"Connected to InfluxDB at {INFLUXDB_URL}")
+                # Enable publish button since InfluxDB is connected
+                self.widgetOpen.pushButton_Publish.setEnabled(True)
+            except Exception as e:
+                logger.error(f"Failed to connect to InfluxDB: {e}")
+                self.influxdb_client = None
+                self.write_api = None
+        
+        # Setup FPS update timer
+        self.fps_timer = QTimer()
+        self.fps_timer.timeout.connect(self.update_fps_label)
+        self.fps_timer.start(500)  # Update every 500ms
+
+        # Publishing state
+        self.is_publishing_continuous = False
+
+    def update_fps_label(self):
+        """Update FPS label with moving average FPS value."""
+        current_fps = self.widgetVideo.get_fps()
+        
+        # Update moving average history
+        if current_fps > 0:  # Only add valid FPS values
+            self.fps_history.append(current_fps)
+            # Keep only the last N samples
+            if len(self.fps_history) > FPS_MOVING_AVERAGE_WINDOW:
+                self.fps_history.pop(0)
+            # Calculate moving average
+            self.moving_average_fps = sum(self.fps_history) / len(self.fps_history)
+        
+        # Display moving average FPS
+        self.widgetOpen.label_FPS.setText(f"FPS: {self.moving_average_fps:.1f}")
+
+        # Publish FPS metrics to InfluxDB if continuous publishing is enabled
+        if self.is_publishing_continuous:
+            self.publish_fps_to_influxdb()
+    
+    def publish_fps_to_influxdb(self):
+        """Publish FPS metrics to InfluxDB."""
+        if not self.write_api or not INFLUXDB_AVAILABLE:
+            return
+        
+        try:
+            # Get stream name from combobox
+            comboBox_URL = self.widgetOpen.findChild(QComboBox, "comboBox_URL")
+            stream_name = comboBox_URL.currentText() if comboBox_URL else "unknown"
+
+            # Use Point API instead of raw line protocol to avoid formatting issues
+            point = Point(INFLUXDB_MEASUREMENT) \
+                .tag("stream", stream_name) \
+                .field("average_fps", float(self.moving_average_fps)) \
+                .field("current_fps", float(self.widgetVideo.get_fps()))
+
+            # Write to InfluxDB
+            self.write_api.write(
+                bucket=INFLUXDB_BUCKET,
+                org=INFLUXDB_ORG,
+                record=point
+            )
+
+        except Exception as e:
+            logger_temp.error(f"Failed to publish FPS metrics to InfluxDB: {e}")
+            if self.influxdb_client:
+                try:
+                    self.influxdb_client.close()
+                except Exception:
+                    pass  # Ignore errors when closing
+            self.influxdb_client = None  # Reset connection on error
+            self.write_api = None
+
 
     def on_open_button_clicked(self):
         if self.widgetVideo.state == VideoState.STATE_OPEN or self.widgetVideo.state == VideoState.STATE_CONNECTING:
@@ -1475,6 +1643,48 @@ class Player(QWidget):
         else:
             self.widgetVideo.start_recording()
 
+    def on_publish_button_clicked(self):
+        """Handle publish button click - toggle continuous publishing to InfluxDB."""
+        if self.is_publishing_continuous:
+            # Stop continuous publishing
+            self.is_publishing_continuous = False
+            self.widgetOpen.pushButton_Publish.setText("Publish to DB")
+
+            # Show status message
+            self.show_status_message("Continuous publishing stopped", 2000)
+
+            # Log the stop
+            logger.info("Continuous publishing to InfluxDB stopped")
+        else:
+            # Start continuous publishing
+            self.is_publishing_continuous = True
+            self.widgetOpen.pushButton_Publish.setText("Stop Publishing")
+
+            # Do an immediate publish to start
+            try:
+                self.publish_fps_to_influxdb()
+                self.show_status_message("Continuous publishing started", 2000)
+                logger.info("Continuous publishing to InfluxDB started")
+            except Exception as e:
+                logger.error(f"Initial publish failed: {e}")
+                self.show_status_message(f"Failed to start publishing: {str(e)}", 3000)
+                # Reset state on failure
+                self.is_publishing_continuous = False
+                self.widgetOpen.pushButton_Publish.setText("Publish to DB")
+
+    def show_status_message(self, message, timeout_milliseconds=None):
+        """Show a message in the main window's status bar."""
+        # Find the parent QMainWindow to access its status bar
+        parent = self.parent()
+        while parent and not hasattr(parent, 'statusBar'):
+            parent = parent.parent()
+
+        if parent and hasattr(parent, 'statusBar'):
+            parent.statusBar().showMessage(message)
+            if timeout_milliseconds:
+                from PyQt5.QtCore import QTimer
+                QTimer.singleShot(timeout_milliseconds, lambda: parent.statusBar().clearMessage())
+
     def resizeEvent(self, event):
         print(f"Player resized to: {event.size().width()}x{event.size().height()}")
 
@@ -1483,6 +1693,16 @@ class Player(QWidget):
         self.widgetVideo.setGeometry(0, FONT_SIZE_PIXELS * 4, event.size().width(), event.size().height() - self.widgetOpen.height() - int(FONT_SIZE_PIXELS + FONT_SIZE_PIXELS/2))
 
         super().resizeEvent(event)
+    
+    def closeEvent(self, event):
+        """Cleanup when Player is closed."""
+        if self.influxdb_client:
+            try:
+                self.influxdb_client.close()
+                logger.info("InfluxDB client closed")
+            except Exception as e:
+                logger.error(f"Error closing InfluxDB client: {e}")
+        event.accept()
 
 class MainWindow(QMainWindow):
     def __init__(self):

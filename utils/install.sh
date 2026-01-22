@@ -123,6 +123,9 @@ else
     echo "✗ V4L2 utilities not found"
 fi
 
+echo "Installing influxdb-client Python package..."
+pip3 install --break-system-packages influxdb-client && echo "✓ influxdb-client installed" || echo "✗ Failed to install influxdb-client"
+
 echo ""
 echo "=========================================="
 echo "Installation complete!"
@@ -131,4 +134,5 @@ echo ""
 echo "Next steps:"
 echo "1. Check hardware encoders: cd publisher && ./check-hw-encoders.sh"
 echo "2. List video devices: python3 publisher/video-publisher.py -l"
+echo "3. Clear InfluxDB bucket (if needed): python3 utils/clear_bucket.py fcclab"
 echo ""
