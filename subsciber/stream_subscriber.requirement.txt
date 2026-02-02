@@ -1,0 +1,3 @@
+PyQt5
+PyGObject
+influxdb-client
