@@ -336,6 +336,7 @@ class Streamer:
         except KeyboardInterrupt:
             return False # Signal to stop completely
         finally:
+            print("Set final state NULL")
             self.pipeline.set_state(Gst.State.NULL)
         return True # Signal to retry
 
@@ -387,7 +388,6 @@ def main():
         
         retry_count += 1
         print(f"\nRestarting stream in {RECONNECT_DELAY}s... (attempt {retry_count})")
-        streamer.stop()
         time.sleep(RECONNECT_DELAY)
 
 if __name__ == '__main__':
