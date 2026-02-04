@@ -165,6 +165,21 @@ class Video(QOpenGLWidget):
 
         self.source.set_property("latency", 100)  # Adjust latency for real-time streaming
         logger.debug("Set rtspsrc latency to 100ms")
+        
+        # Configure RTSP transport (force TCP by default to avoid UDP timeouts)
+        try:
+            settings = load_settings()
+            transport = settings.get("rtsp_transport", "tcp")
+            if transport == "tcp":
+                self.source.set_property("protocols", 4)  # 4 = GstRTSPLowerTrans.TCP
+                logger.info("Forcing RTSP transport to TCP")
+            elif transport == "udp":
+                self.source.set_property("protocols", 1)  # 1 = GstRTSPLowerTrans.UDP
+                logger.info("Forcing RTSP transport to UDP")
+            else:
+                logger.debug(f"Using default RTSP transport (protocols={transport})")
+        except Exception as e:
+            logger.error(f"Error setting RTSP transport: {e}")
         # self.source.set_property("tcp-timeout", 2000000)
         # self.source.set_property("timeout", 2000000)
 
@@ -1351,7 +1366,8 @@ def load_settings():
             "window_x": None,
             "window_y": None,
             "window_width": None,
-            "window_height": None
+            "window_height": None,
+            "rtsp_transport": "tcp"
         }
     
     # Load actual config file
