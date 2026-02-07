@@ -124,7 +124,11 @@ else
 fi
 
 echo "Installing influxdb-client Python package..."
-pip3 install --break-system-packages influxdb-client && echo "✓ influxdb-client installed" || echo "✗ Failed to install influxdb-client"
+if pip3 install --help | grep -q "break-system-packages"; then
+    pip3 install --break-system-packages influxdb-client && echo "✓ influxdb-client installed" || echo "✗ Failed to install influxdb-client"
+else
+    pip3 install influxdb-client && echo "✓ influxdb-client installed" || echo "✗ Failed to install influxdb-client"
+fi
 
 echo ""
 echo "=========================================="

@@ -28,9 +28,12 @@ sudo apt-get install -y \
     pyqt5-dev-tools
 
 echo "Installing Python dependencies from requirements file..."
-# Using --break-system-packages because Debian 12+ restricts pip install to venvs by default
-# This is acceptable for a dedicated development environment.
-pip3 install --break-system-packages -r stream_subscriber.requirement.txt
+# Check if --break-system-packages is supported (required on Debian 12+ / Ubuntu 23.04+)
+if pip3 install --help | grep -q "break-system-packages"; then
+    pip3 install --break-system-packages -r stream_subscriber.requirement.txt
+else
+    pip3 install -r stream_subscriber.requirement.txt
+fi
 
 echo "Making scripts executable..."
 chmod +x run.sh
