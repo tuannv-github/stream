@@ -1,7 +1,7 @@
 build
 dist
 *.spec
-stream_subscriber.conf
+stream_subscriber.yaml
 recordings/
 *.log*
 __pycache__/

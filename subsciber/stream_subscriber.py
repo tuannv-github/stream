@@ -8,8 +8,8 @@ import time
 from PyQt5.uic import loadUi
 import threading
 from enum import Enum
-import json
 import os
+import yaml
 import shutil
 from pathlib import Path
 from datetime import datetime
@@ -34,9 +34,25 @@ except ImportError:
     logger_temp = logging.getLogger(__name__)
     logger_temp.warning("influxdb-client not installed. Install with: pip install influxdb-client")
 
-CONFIG_FILE = os.path.join(os.path.dirname(__file__), "stream_subscriber.conf")
-DEFAULT_CONFIG_FILE = os.path.join(os.path.dirname(__file__), "stream_subscriber.default.conf")
+CONFIG_FILE = os.path.join(os.path.dirname(__file__), "stream_subscriber.yaml")
+DEFAULT_CONFIG_FILE = os.path.join(os.path.dirname(__file__), "stream_subscriber.default.yaml")
 LOG_FILE = os.path.join(os.path.dirname(__file__), "stream_subscriber.log")
+
+# Single source of default settings (used when config file missing or invalid)
+DEFAULT_SETTINGS = {
+    "urls": [],
+    "url_index": 0,
+    "window_x": None,
+    "window_y": None,
+    "window_width": None,
+    "window_height": None,
+    "rtsp_transport": "tcp",
+    "influxdb_url": "http://localhost:8086",
+    "influxdb_org": "fcclab",
+    "influxdb_bucket": "fcclab",
+    "influxdb_token": "fcclab_token",
+    "influxdb_measurement": "stream_metrics"
+}
 
 # Configure logging
 def setup_logging(log_file=None, log_level=logging.DEBUG):
@@ -95,13 +111,6 @@ FONT_SIZE_PIXELS = 0
 # FPS calculation constants
 FPS_DURATION = 0.5  # Calculate FPS every 0.5 seconds
 FPS_MOVING_AVERAGE_WINDOW = 10
-
-# InfluxDB constants
-INFLUXDB_URL = "http://localhost:8086"
-INFLUXDB_ORG = "fcclab"
-INFLUXDB_BUCKET = "fcclab"
-INFLUXDB_TOKEN = "fcclab_token"
-INFLUXDB_MEASUREMENT = "stream_metrics"  # Measurement name in InfluxDB
 
 class VideoState(Enum):
     STATE_CLOSE = 0
@@ -219,6 +228,21 @@ class Video(QOpenGLWidget):
             logger.debug("Added frame counting probe to convert element sink pad")
         else:
             logger.warning("Could not get sink pad for frame counting probe")
+
+        # Add probe to count bytes for bitrate calculation (on h264parse sink - encoded data)
+        h264_sink_pad = h264parse.get_static_pad("sink")
+        if h264_sink_pad:
+            def bytes_probe_callback(pad, info):
+                """Callback to count bytes received for bitrate calculation."""
+                buf = info.get_buffer()
+                if buf:
+                    self.bytes_received += buf.get_size()
+                return Gst.PadProbeReturn.OK
+
+            h264_sink_pad.add_probe(Gst.PadProbeType.BUFFER, bytes_probe_callback)
+            logger.debug("Added byte counting probe to h264parse sink pad for bitrate")
+        else:
+            logger.warning("Could not get h264parse sink pad for bitrate probe")
         
         # Recording elements (will be added when recording starts)
         self.recording_queue = None
@@ -271,6 +295,11 @@ class Video(QOpenGLWidget):
         logger.info(f"Opening stream: {url_name} at URL: {url}")
         self.source.set_property("location", url)
         logger.debug(f"Set rtspsrc location to: {url}")
+        # Reset bitrate counters for new stream
+        self.bytes_received = 0
+        self.bitrate_last_bytes = 0
+        self.bitrate_last_time = time.time()
+        self.current_bitrate_mbps = 0.0
         
         ret = self.pipeline.set_state(Gst.State.PLAYING)
         logger.debug(f"Pipeline set_state(PLAYING) returned: {ret}")
@@ -315,7 +344,17 @@ class Video(QOpenGLWidget):
     def get_fps(self):
         """Get the current FPS value."""
         return self.current_fps
-    
+
+    def get_bitrate_mbps(self):
+        """Get current receive bitrate in Mbps (calculated from bytes received since last call)."""
+        current_time = time.time()
+        duration = current_time - self.bitrate_last_time
+        if duration > 0 and self.bytes_received > self.bitrate_last_bytes:
+            self.current_bitrate_mbps = (self.bytes_received - self.bitrate_last_bytes) * 8 / (1024 * 1024) / duration
+            self.bitrate_last_bytes = self.bytes_received
+            self.bitrate_last_time = current_time
+        return self.current_bitrate_mbps
+
     def _handle_disconnect_with_recording(self):
         """Handle disconnect when recording is active - stop and save recording, set auto-restart flag."""
         if self.is_recording:
@@ -1100,6 +1139,12 @@ class Video(QOpenGLWidget):
         self.fps_last_time = time.time()
         self.current_fps = 0.0
 
+        # Initialize bitrate tracking (bytes received from stream)
+        self.bytes_received = 0
+        self.bitrate_last_bytes = 0
+        self.bitrate_last_time = time.time()
+        self.current_bitrate_mbps = 0.0
+
         # Connect signal for auto-starting recording (signal is thread-safe)
         self.sig_auto_start_recording.connect(self._auto_start_recording_after_reconnect)
 
@@ -1338,8 +1383,17 @@ class Video(QOpenGLWidget):
     def closeEvent(self, event):
         self.close_stream()
 
+def _load_yaml(path):
+    """Load YAML file, return None on error."""
+    try:
+        with open(path, 'r') as f:
+            return yaml.safe_load(f)
+    except (yaml.YAMLError, IOError) as e:
+        logger.error(f"Error loading {path}: {e}")
+        return None
+
 def load_settings():
-    """Load settings from configuration file."""
+    """Load settings from configuration file (YAML format)."""
     logger.debug(f"Loading settings from {CONFIG_FILE}")
     # Copy default config if config file doesn't exist
     if not os.path.exists(CONFIG_FILE) and os.path.exists(DEFAULT_CONFIG_FILE):
@@ -1349,62 +1403,45 @@ def load_settings():
         except IOError as e:
             logger.error(f"Error copying default config file: {e}")
     
-    # Load defaults from default config file
+    # Load defaults from default config file, merge with DEFAULT_SETTINGS for any missing keys
     default_settings = None
     if os.path.exists(DEFAULT_CONFIG_FILE):
-        try:
-            with open(DEFAULT_CONFIG_FILE, 'r') as f:
-                default_settings = json.load(f)
-        except (json.JSONDecodeError, IOError) as e:
-            logger.error(f"Error loading default config file: {e}")
-    
-    # Fallback defaults if default config file doesn't exist or is invalid
+        default_settings = _load_yaml(DEFAULT_CONFIG_FILE)
+        if default_settings:
+            for k, v in DEFAULT_SETTINGS.items():
+                if k not in default_settings:
+                    default_settings[k] = v
     if default_settings is None:
-        default_settings = {
-            "urls": [],
-            "url_index": 0,
-            "window_x": None,
-            "window_y": None,
-            "window_width": None,
-            "window_height": None,
-            "rtsp_transport": "tcp"
-        }
+        default_settings = {k: (list(v) if k == "urls" else v) for k, v in DEFAULT_SETTINGS.items()}
     
     # Load actual config file
     if os.path.exists(CONFIG_FILE):
-        try:
-            with open(CONFIG_FILE, 'r') as f:
-                settings = json.load(f)
-                # Merge with defaults to ensure all keys exist
-                for key in default_settings:
-                    if key not in settings:
-                        settings[key] = default_settings[key]
-                # Validate URLs structure
-                if "urls" in settings and isinstance(settings["urls"], list):
-                    # Ensure each URL has required fields
-                    valid_urls = []
-                    for url_item in settings["urls"]:
-                        if isinstance(url_item, dict) and "url" in url_item and "name" in url_item:
-                            valid_urls.append(url_item)
-                    if valid_urls:
-                        settings["urls"] = valid_urls
-                    else:
-                        settings["urls"] = default_settings.get("urls", [])
-                else:
-                    settings["urls"] = default_settings.get("urls", [])
-                return settings
-        except (json.JSONDecodeError, IOError) as e:
-            logger.error(f"Error loading config file: {e}. Using defaults.")
-            return default_settings
+        settings = _load_yaml(CONFIG_FILE)
+        if settings:
+            # Merge with defaults to ensure all keys exist
+            for key in default_settings:
+                if key not in settings:
+                    settings[key] = default_settings[key]
+            # Validate URLs structure
+            if "urls" in settings and isinstance(settings["urls"], list):
+                valid_urls = []
+                for url_item in settings["urls"]:
+                    if isinstance(url_item, dict) and "url" in url_item and "name" in url_item:
+                        valid_urls.append(url_item)
+                settings["urls"] = valid_urls if valid_urls else default_settings.get("urls", [])
+            else:
+                settings["urls"] = default_settings.get("urls", [])
+            return settings
+        logger.error(f"Error loading config file. Using defaults.")
     
     return default_settings
 
 def save_settings(settings):
-    """Save settings to configuration file."""
+    """Save settings to configuration file (YAML format)."""
     logger.debug(f"Saving settings to {CONFIG_FILE}")
     try:
         with open(CONFIG_FILE, 'w') as f:
-            json.dump(settings, f, indent=4)
+            yaml.dump(settings, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
         logger.debug("Settings saved successfully")
     except IOError as e:
         logger.error(f"Error saving config file: {e}")
@@ -1557,15 +1594,21 @@ class Player(QWidget):
         # Setup InfluxDB client
         self.influxdb_client = None
         self.write_api = None
+        settings = load_settings()
+        self.influxdb_url = settings.get("influxdb_url", "http://localhost:8086")
+        self.influxdb_org = settings.get("influxdb_org", "fcclab")
+        self.influxdb_bucket = settings.get("influxdb_bucket", "fcclab")
+        self.influxdb_token = settings.get("influxdb_token", "fcclab_token")
+        self.influxdb_measurement = settings.get("influxdb_measurement", "stream_metrics")
         if INFLUXDB_AVAILABLE:
             try:
                 self.influxdb_client = InfluxDBClient(
-                    url=INFLUXDB_URL,
-                    token=INFLUXDB_TOKEN,
-                    org=INFLUXDB_ORG
+                    url=self.influxdb_url,
+                    token=self.influxdb_token,
+                    org=self.influxdb_org
                 )
                 self.write_api = self.influxdb_client.write_api(write_precision="s")
-                logger.info(f"Connected to InfluxDB at {INFLUXDB_URL}")
+                logger.info(f"Connected to InfluxDB at {self.influxdb_url}")
                 # Enable publish button since InfluxDB is connected
                 self.widgetOpen.pushButton_Publish.setEnabled(True)
             except Exception as e:
@@ -1612,15 +1655,18 @@ class Player(QWidget):
             stream_name = comboBox_URL.currentText() if comboBox_URL else "unknown"
 
             # Use Point API instead of raw line protocol to avoid formatting issues
-            point = Point(INFLUXDB_MEASUREMENT) \
+            bitrate_mbps = self.widgetVideo.get_bitrate_mbps()
+            point = Point(self.influxdb_measurement) \
                 .tag("stream", stream_name) \
                 .field("average_fps", float(self.moving_average_fps)) \
-                .field("current_fps", float(self.widgetVideo.get_fps()))
+                .field("current_fps", float(self.widgetVideo.get_fps())) \
+                .field("bitrate_mbps", float(bitrate_mbps)) \
+                .field("x", 0)
 
             # Write to InfluxDB
             self.write_api.write(
-                bucket=INFLUXDB_BUCKET,
-                org=INFLUXDB_ORG,
+                bucket=self.influxdb_bucket,
+                org=self.influxdb_org,
                 record=point
             )
 

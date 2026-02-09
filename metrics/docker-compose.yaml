@@ -16,3 +16,35 @@ services:
       DOCKER_INFLUXDB_INIT_BUCKET: fcclab
       DOCKER_INFLUXDB_INIT_RETENTION: 30d
       DOCKER_INFLUXDB_INIT_ADMIN_TOKEN: fcclab_token
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./grafana/provisioning/datasources:/etc/grafana/provisioning/datasources
+      - ./grafana/dashboards:/var/lib/grafana/dashboards
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin123
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_DASHBOARDS_MIN_REFRESH_INTERVAL: 1s
+    depends_on:
+      - influxdb
+
+  load-dashboard:
+    image: python:3-slim
+    container_name: load-dashboard
+    volumes:
+      - ./grafana/dashboards:/dashboards
+      - ./load-dashboard.py:/load-dashboard.py
+    environment:
+      GRAFANA_URL: http://grafana:3000
+      GRAFANA_USER: admin
+      GRAFANA_PASSWORD: admin123
+      DASHBOARDS_DIR: /dashboards
+    command: ["python3", "/load-dashboard.py"]
+    depends_on:
+      - grafana
+    restart: "no"

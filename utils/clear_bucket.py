@@ -8,15 +8,27 @@ Example: python3 clear_bucket.py fcclab
 """
 
 import sys
+import os
 import argparse
+import yaml
 from datetime import datetime, timezone
 from influxdb_client import InfluxDBClient
 from influxdb_client.client.delete_api import DeleteApi
 
-# InfluxDB configuration (same as stream_subscriber.py)
-INFLUXDB_URL = "http://localhost:8086"
-INFLUXDB_ORG = "fcclab"
-INFLUXDB_TOKEN = "fcclab_token"
+# Config path: subsciber/stream_subscriber.yaml (relative to this script's parent)
+_CONFIG_PATH = os.path.join(os.path.dirname(__file__), "..", "subsciber", "stream_subscriber.yaml")
+
+def _load_config():
+    """Load InfluxDB config from stream_subscriber.yaml."""
+    defaults = {"influxdb_url": "http://localhost:8086", "influxdb_org": "fcclab", "influxdb_token": "fcclab_token"}
+    if os.path.exists(_CONFIG_PATH):
+        try:
+            with open(_CONFIG_PATH) as f:
+                cfg = yaml.safe_load(f) or {}
+            return {k: cfg.get(k, v) for k, v in defaults.items()}
+        except Exception:
+            pass
+    return defaults
 
 def clear_bucket(bucket_name):
     """
@@ -28,14 +40,15 @@ def clear_bucket(bucket_name):
     Returns:
         bool: True if successful, False if failed
     """
+    cfg = _load_config()
     client = None
     try:
         # Connect to InfluxDB
-        print(f"Connecting to InfluxDB at {INFLUXDB_URL}...")
+        print(f"Connecting to InfluxDB at {cfg['influxdb_url']}...")
         client = InfluxDBClient(
-            url=INFLUXDB_URL,
-            token=INFLUXDB_TOKEN,
-            org=INFLUXDB_ORG
+            url=cfg["influxdb_url"],
+            token=cfg["influxdb_token"],
+            org=cfg["influxdb_org"]
         )
 
         # Verify connection
@@ -44,7 +57,7 @@ def clear_bucket(bucket_name):
             print(f"❌ InfluxDB connection failed: {health.message}")
             return False
 
-        print(f"✅ Connected to InfluxDB (org: {INFLUXDB_ORG})")
+        print(f"✅ Connected to InfluxDB (org: {cfg['influxdb_org']})")
 
         # Get delete API
         delete_api = client.delete_api()
@@ -62,7 +75,7 @@ def clear_bucket(bucket_name):
             start=start_time,
             stop=stop_time,
             bucket=bucket_name,
-            org=INFLUXDB_ORG,
+            org=cfg["influxdb_org"],
             predicate=""  # Empty predicate deletes all data
         )
 
@@ -106,11 +119,12 @@ Examples:
 
     # Safety check - require explicit confirmation unless --yes is used
     if not args.yes:
+        cfg = _load_config()
         print("==========================================")
         print(f"Clearing InfluxDB bucket: {args.bucket_name}")
         print("==========================================")
-        print(f"Organization: {INFLUXDB_ORG}")
-        print(f"InfluxDB URL: {INFLUXDB_URL}")
+        print(f"Organization: {cfg['influxdb_org']}")
+        print(f"InfluxDB URL: {cfg['influxdb_url']}")
         print()
         print(f"⚠️  WARNING: This will delete ALL data in bucket '{args.bucket_name}'")
         try:
