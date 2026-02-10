@@ -110,6 +110,7 @@ FONT_SIZE_PIXELS = 0
 
 # FPS calculation constants
 FPS_DURATION = 0.5  # Calculate FPS every 0.5 seconds
+METRICS_UPDATE_PERIOD = 0.5 # Calculate metrics every 0.5 seconds
 FPS_MOVING_AVERAGE_WINDOW = 10
 
 class VideoState(Enum):
@@ -122,6 +123,7 @@ class Video(QOpenGLWidget):
     sig_state_changed = pyqtSignal(VideoState)
     sig_recording_changed = pyqtSignal(str)  # Signal for recording state changes: "recording", "saving", "stopped"
     sig_auto_start_recording = pyqtSignal()  # Signal to auto-start recording after reconnect
+    sig_metrics_update = pyqtSignal(float, float) # Signal for metrics update (fps, bitrate)
 
     def __change_state(self, state):
         current_state = getattr(self, 'state', None)
@@ -131,7 +133,7 @@ class Video(QOpenGLWidget):
             logger.info("Video state changed to CLOSE")
         elif self.state == VideoState.STATE_OPEN:
             logger.info("Video state changed to OPEN")
-            # Auto-start recording if it was enabled before disconnect
+            # Auto-start recording if it was accepted before disconnect
             if self.auto_record_on_reconnect:
                 logger.info(f"Auto-starting recording after reconnect... (flag={self.auto_record_on_reconnect})")
                 # Emit signal to auto-start recording (signals are thread-safe and will be handled in main thread)
@@ -298,8 +300,14 @@ class Video(QOpenGLWidget):
         # Reset bitrate counters for new stream
         self.bytes_received = 0
         self.bitrate_last_bytes = 0
-        self.bitrate_last_time = time.time()
+        self.total_frames = 0
+        self.fps_last_frames = 0
+        
+        # Reset calculated values
         self.current_bitrate_mbps = 0.0
+        self.current_fps = 0.0
+        
+        self.metrics_last_time = time.time()
         
         ret = self.pipeline.set_state(Gst.State.PLAYING)
         logger.debug(f"Pipeline set_state(PLAYING) returned: {ret}")
@@ -322,37 +330,63 @@ class Video(QOpenGLWidget):
             self.__change_state(VideoState.STATE_CLOSE)
             logger.info("Stream closed successfully")
     
-    def calculate_fps(self):
-        """Calculate FPS every FPS_DURATION seconds and update current_fps."""
+    def _calculate_metrics(self):
+        """Calculate metrics and emit signal."""
+        # Calculate time delta
         current_time = time.time()
-        elapsed_time = current_time - self.fps_last_time
+        time_delta = current_time - self.metrics_last_time
         
-        if elapsed_time >= FPS_DURATION:
-            # Calculate FPS
-            self.current_fps = self.frame_count / elapsed_time
-            logger.debug(f"FPS: {self.current_fps:.2f} (frames: {self.frame_count}, time: {elapsed_time:.2f}s)")
-            
-            # Reset counters
-            self.frame_count = 0
-            self.fps_last_time = current_time
+        if time_delta <= 0:
+            return
+
+        # Calculate FPS
+        # Frames delta / time delta
+        current_frames = self.total_frames
+        frames_delta = current_frames - self.fps_last_frames
+        self.current_fps = frames_delta / time_delta
+        
+        # Calculate Bitrate
+        # Bytes delta * 8 / (1024*1024) / time delta
+        current_bytes = self.bytes_received
+        bytes_delta = current_bytes - self.bitrate_last_bytes
+        self.current_bitrate_mbps = (bytes_delta * 8) / (1024 * 1024) / time_delta
+        
+        # Update last values
+        self.fps_last_frames = current_frames
+        self.bitrate_last_bytes = current_bytes
+        self.metrics_last_time = current_time
+        
+        # Emit signal to player
+        self.sig_metrics_update.emit(self.current_fps, self.current_bitrate_mbps)
     
     def increment_frame_count(self):
-        """Increment frame count and calculate FPS."""
-        self.frame_count += 1
-        self.calculate_fps()
+        """Increment total frame count."""
+        self.total_frames += 1
+
+    def start_metrics_timer(self):
+        """Start the metrics update timer."""
+        if not self._metrics_timer.isActive():
+            # Reset counters to avoid stale data spikes
+            self.metrics_last_time = time.time()
+            self.fps_last_frames = self.total_frames
+            self.bitrate_last_bytes = self.bytes_received
+            
+            self._metrics_timer.start(int(METRICS_UPDATE_PERIOD * 1000))
+            logger.info("Metrics timer started")
+
+    def stop_metrics_timer(self):
+        """Stop the metrics update timer."""
+        if self._metrics_timer.isActive():
+            self._metrics_timer.stop()
+            logger.info("Metrics timer stopped")
+
     
     def get_fps(self):
         """Get the current FPS value."""
         return self.current_fps
 
     def get_bitrate_mbps(self):
-        """Get current receive bitrate in Mbps (calculated from bytes received since last call)."""
-        current_time = time.time()
-        duration = current_time - self.bitrate_last_time
-        if duration > 0 and self.bytes_received > self.bitrate_last_bytes:
-            self.current_bitrate_mbps = (self.bytes_received - self.bitrate_last_bytes) * 8 / (1024 * 1024) / duration
-            self.bitrate_last_bytes = self.bytes_received
-            self.bitrate_last_time = current_time
+        """Get current receive bitrate in Mbps."""
         return self.current_bitrate_mbps
 
     def _handle_disconnect_with_recording(self):
@@ -1132,21 +1166,26 @@ class Video(QOpenGLWidget):
         Gst.init(None)  # Initialize GStreamer
 
         self.__create_pipeline()
-        self.__change_state(VideoState.STATE_CLOSE)
-
+        
         # Initialize FPS tracking
-        self.frame_count = 0
-        self.fps_last_time = time.time()
+        self.total_frames = 0
+        self.fps_last_frames = 0
         self.current_fps = 0.0
 
         # Initialize bitrate tracking (bytes received from stream)
         self.bytes_received = 0
         self.bitrate_last_bytes = 0
-        self.bitrate_last_time = time.time()
+        self.metrics_last_time = time.time()
         self.current_bitrate_mbps = 0.0
-
+        
         # Connect signal for auto-starting recording (signal is thread-safe)
         self.sig_auto_start_recording.connect(self._auto_start_recording_after_reconnect)
+
+        # Setup metrics timer (but don't start it yet - starts in STATE_OPEN)
+        self._metrics_timer = QTimer()
+        self._metrics_timer.timeout.connect(self._calculate_metrics)
+
+        self.__change_state(VideoState.STATE_CLOSE)
 
         self.bus_thread = threading.Thread(target=self.pipeline_bus_check)
         self.bus_thread.daemon = True  # Allow main application to exit even if thread is still running
@@ -1586,6 +1625,7 @@ class Player(QWidget):
         
         self.widgetVideo.sig_state_changed.connect(self.widgetOpen.sig_state_changed)
         self.widgetVideo.sig_recording_changed.connect(self.widgetOpen.sig_recording_changed)
+        self.widgetVideo.sig_metrics_update.connect(self.on_metrics_update)
         
         # Initialize FPS moving average tracking
         self.fps_history = []  # List to store recent FPS values
@@ -1616,24 +1656,18 @@ class Player(QWidget):
                 self.influxdb_client = None
                 self.write_api = None
         
-        # Setup FPS update timer
-        self.fps_timer = QTimer()
-        self.fps_timer.timeout.connect(self.update_fps_label)
-        self.fps_timer.start(500)  # Update every 500ms
-
         # Publishing state
         self.is_publishing_continuous = False
 
-    def update_fps_label(self):
-        """Update FPS label with moving average FPS value."""
-        current_fps = self.widgetVideo.get_fps()
-        
+    def on_metrics_update(self, fps, bitrate):
+        """Update FPS label and publish to DB."""
         # Update moving average history
-        if current_fps > 0:  # Only add valid FPS values
-            self.fps_history.append(current_fps)
+        if fps >= 0:
+            self.fps_history.append(fps)
             # Keep only the last N samples
             if len(self.fps_history) > FPS_MOVING_AVERAGE_WINDOW:
                 self.fps_history.pop(0)
+            
             # Calculate moving average
             self.moving_average_fps = sum(self.fps_history) / len(self.fps_history)
         
@@ -1642,10 +1676,10 @@ class Player(QWidget):
 
         # Publish FPS metrics to InfluxDB if continuous publishing is enabled
         if self.is_publishing_continuous:
-            self.publish_fps_to_influxdb()
+            self.publish_metrics(fps, bitrate)
     
-    def publish_fps_to_influxdb(self):
-        """Publish FPS metrics to InfluxDB."""
+    def publish_metrics(self, fps, bitrate):
+        """Publish metrics to InfluxDB."""
         if not self.write_api or not INFLUXDB_AVAILABLE:
             return
         
@@ -1654,13 +1688,12 @@ class Player(QWidget):
             comboBox_URL = self.widgetOpen.findChild(QComboBox, "comboBox_URL")
             stream_name = comboBox_URL.currentText() if comboBox_URL else "unknown"
 
-            # Use Point API instead of raw line protocol to avoid formatting issues
-            bitrate_mbps = self.widgetVideo.get_bitrate_mbps()
+            # Use Point API
             point = Point(self.influxdb_measurement) \
                 .tag("stream", stream_name) \
                 .field("average_fps", float(self.moving_average_fps)) \
-                .field("current_fps", float(self.widgetVideo.get_fps())) \
-                .field("bitrate_mbps", float(bitrate_mbps)) \
+                .field("current_fps", float(fps)) \
+                .field("bitrate_mbps", float(bitrate)) \
                 .field("x", 0)
 
             # Write to InfluxDB
@@ -1671,7 +1704,7 @@ class Player(QWidget):
             )
 
         except Exception as e:
-            logger_temp.error(f"Failed to publish FPS metrics to InfluxDB: {e}")
+            logger_temp.error(f"Failed to publish metrics to InfluxDB: {e}")
             if self.influxdb_client:
                 try:
                     self.influxdb_client.close()
@@ -1711,6 +1744,9 @@ class Player(QWidget):
             # Stop continuous publishing
             self.is_publishing_continuous = False
             self.widgetOpen.pushButton_Publish.setText("Publish to DB")
+            
+            # Stop metrics timer
+            self.widgetVideo.stop_metrics_timer()
 
             # Show status message
             self.show_status_message("Continuous publishing stopped", 2000)
@@ -1721,10 +1757,13 @@ class Player(QWidget):
             # Start continuous publishing
             self.is_publishing_continuous = True
             self.widgetOpen.pushButton_Publish.setText("Stop Publishing")
+            
+            # Start metrics timer
+            self.widgetVideo.start_metrics_timer()
 
             # Do an immediate publish to start
             try:
-                self.publish_fps_to_influxdb()
+                self.publish_metrics(self.widgetVideo.get_fps(), self.widgetVideo.get_bitrate_mbps())
                 self.show_status_message("Continuous publishing started", 2000)
                 logger.info("Continuous publishing to InfluxDB started")
             except Exception as e:
