@@ -124,6 +124,8 @@ class Video(QOpenGLWidget):
     sig_recording_changed = pyqtSignal(str)  # Signal for recording state changes: "recording", "saving", "stopped"
     sig_auto_start_recording = pyqtSignal()  # Signal to auto-start recording after reconnect
     sig_metrics_update = pyqtSignal(float, float) # Signal for metrics update (fps, bitrate)
+    # Marshals reconnect scheduling to the GUI thread (required for glimagesink / OpenGL stability)
+    sig_schedule_pipeline_reconnect = pyqtSignal(int)
 
     def __change_state(self, state):
         current_state = getattr(self, 'state', None)
@@ -159,6 +161,7 @@ class Video(QOpenGLWidget):
         decoder = Gst.ElementFactory.make("avdec_h264", "decoder")
         convert = Gst.ElementFactory.make("videoconvert", "convert")
         sink = Gst.ElementFactory.make("glimagesink", "sink")
+        self._video_sink = sink
 
         if not all([self.source, rtph264depay, h264parse, self.tee, decoder, convert, sink]):
             logger.error("Failed to create GStreamer elements")
@@ -292,6 +295,7 @@ class Video(QOpenGLWidget):
             logger.warning("Video is already open, ignoring open_stream request")
             return
 
+        self._playback_intent = True
         url = URLs[URL_index]["url"]
         url_name = URLs[URL_index].get("name", "Unknown")
         logger.info(f"Opening stream: {url_name} at URL: {url}")
@@ -309,6 +313,7 @@ class Video(QOpenGLWidget):
         
         self.metrics_last_time = time.time()
         
+        self._attach_video_sink()
         ret = self.pipeline.set_state(Gst.State.PLAYING)
         logger.debug(f"Pipeline set_state(PLAYING) returned: {ret}")
         self.__change_state(VideoState.STATE_CONNECTING)
@@ -320,16 +325,63 @@ class Video(QOpenGLWidget):
             return
         elif self.state == VideoState.STATE_OPEN or self.state == VideoState.STATE_CONNECTING:
             logger.info("Closing stream...")
-            # Stop recording if active and clear auto-record flag
+            # Stops reconnect scheduling before any synchronous pipeline work.
+            self._playback_intent = False
+            try:
+                self._reconnect_timer.stop()
+            except Exception:
+                pass
+
             if self.is_recording:
                 logger.info("Stopping active recording before closing stream")
                 self.stop_recording()
             self.auto_record_on_reconnect = False  # Clear flag when manually closing
-            ret = self.pipeline.set_state(Gst.State.NULL)
-            logger.debug(f"Pipeline set_state(NULL) returned: {ret}")
-            self.__change_state(VideoState.STATE_CLOSE)
-            logger.info("Stream closed successfully")
-    
+
+            with self._gst_pipeline_lock:
+                self._detach_video_sink()
+                try:
+                    self.pipeline.set_state(Gst.State.READY)
+                    self.pipeline.get_state(Gst.SECOND)
+                except Exception as e:
+                    logger.debug(f"READY transition during close: {e}")
+                try:
+                    ret = self.pipeline.set_state(Gst.State.NULL)
+                    logger.debug(f"Pipeline set_state(NULL) returned: {ret}")
+                    self.pipeline.get_state(5 * Gst.SECOND)
+                except Exception as e:
+                    logger.error(f"Pipeline NULL during close: {e}", exc_info=True)
+
+                self.__change_state(VideoState.STATE_CLOSE)
+                logger.info("Stream closed successfully")
+
+    def _detach_video_sink(self):
+        """Unbind GL sink from the Qt window before destroying the pipeline (avoids compositor/GPU crashes)."""
+        sink = getattr(self, "_video_sink", None)
+        if sink is None and getattr(self, "pipeline", None):
+            sink = self.pipeline.get_by_name("sink")
+        if sink is None:
+            return
+        try:
+            sink.set_window_handle(0)
+        except Exception as e:
+            logger.debug(f"detach glimagesink window handle: {e}")
+
+    def _attach_video_sink(self):
+        """Bind glimagesink to this widget — required again after NULL->PLAYING or window changes."""
+        sink = getattr(self, "_video_sink", None)
+        if sink is None and getattr(self, "pipeline", None):
+            sink = self.pipeline.get_by_name("sink")
+        if sink is None:
+            return
+        try:
+            wid = int(self.winId())
+            if wid == 0:
+                logger.warning("Video widget winId is 0; GL sink may stay black until widget is shown")
+            sink.set_window_handle(wid)
+            logger.debug(f"glimagesink window handle set to {wid}")
+        except Exception as e:
+            logger.warning(f"attach glimagesink failed: {e}")
+
     def _calculate_metrics(self):
         """Calculate metrics and emit signal."""
         # Calculate time delta
@@ -1187,18 +1239,159 @@ class Video(QOpenGLWidget):
 
         self.__change_state(VideoState.STATE_CLOSE)
 
+        self._playback_intent = False
+        self._gst_pipeline_lock = threading.Lock()
+        self._reconnect_timer = QTimer(self)
+        self._reconnect_timer.setSingleShot(True)
+        self._reconnect_timer.timeout.connect(self._slot_pipeline_reconnect)
+        self.sig_schedule_pipeline_reconnect.connect(
+            self._on_schedule_pipeline_reconnect, Qt.QueuedConnection)
+
         self.bus_thread = threading.Thread(target=self.pipeline_bus_check)
         self.bus_thread.daemon = True  # Allow main application to exit even if thread is still running
         self.bus_thread.start()
+
+    @staticmethod
+    def _reconnect_backoff_ms(attempt):
+        """Exponential backoff (ms); attempt is 1-based failure count."""
+        if attempt < 1:
+            attempt = 1
+        return min(30000, int(500 * (2 ** min(attempt - 1, 6))))
+
+    @pyqtSlot(int)
+    def _on_schedule_pipeline_reconnect(self, delay_ms):
+        """Coalesce reconnects on the GUI thread — safe for GL sink."""
+        if not self._playback_intent:
+            return
+        self._reconnect_timer.stop()
+        self._reconnect_timer.start(max(0, int(delay_ms)))
+
+    @pyqtSlot()
+    def _slot_pipeline_reconnect(self):
+        with self._gst_pipeline_lock:
+            if not self._playback_intent:
+                return
+            logger.warning("Main thread: reconnecting pipeline (NULL -> PLAYING)")
+            try:
+                self.pipeline.set_state(Gst.State.NULL)
+                self.pipeline.get_state(2 * Gst.SECOND)
+            except Exception as e:
+                logger.error(f"Error during reconnect NULL transition: {e}", exc_info=True)
+            if not self._playback_intent:
+                logger.debug("Reconnect aborted after NULL (user closed)")
+                return
+            self._attach_video_sink()
+            try:
+                ret = self.pipeline.set_state(Gst.State.PLAYING)
+                logger.debug(f"Reconnect set_state(PLAYING): {ret}")
+            except Exception as e:
+                logger.error(f"Error during reconnect PLAYING: {e}", exc_info=True)
+
+    @pyqtSlot()
+    def _gst_main_stop_recording(self):
+        self.stop_recording()
+
+    @pyqtSlot()
+    def _gst_main_state_open(self):
+        if not self._playback_intent:
+            logger.debug("Ignoring pipeline OPEN (shutdown or closed)")
+            return
+        self.__change_state(VideoState.STATE_OPEN)
+
+    @pyqtSlot()
+    def _gst_main_state_close(self):
+        self.__change_state(VideoState.STATE_CLOSE)
+
+    def _marshal_stop_recording_from_bus_thread(self):
+        QMetaObject.invokeMethod(self, "_gst_main_stop_recording", Qt.QueuedConnection)
+
+    @pyqtSlot()
+    def _gst_main_recording_teardown_before_reconnect(self):
+        """Remove recording branch on GUI thread before pipeline reset (GL + pad safety)."""
+        preserve_auto = getattr(self, "_reconnect_preserve_auto_record", False)
+        try:
+            if self.recording_tee_pad and self.tee:
+                try:
+                    peer = self.recording_tee_pad.get_peer()
+                    if peer:
+                        self.recording_tee_pad.unlink(peer)
+                    self.recording_tee_pad.set_active(False)
+                    self.tee.release_request_pad(self.recording_tee_pad)
+                except Exception as e:
+                    logger.warning(f"Error releasing tee pad (main thread): {e}")
+                self.recording_tee_pad = None
+            self._cleanup_recording_elements()
+            self.is_recording = False
+            self.is_stopping_recording = False
+            if preserve_auto:
+                self.auto_record_on_reconnect = True
+                logger.info("Preserved auto_record_on_reconnect after main-thread recording teardown")
+        except Exception as e:
+            logger.error(f"recording teardown before reconnect failed: {e}", exc_info=True)
+
+    def _marshal_recording_teardown_from_bus_thread(self, preserve_auto_record):
+        self._reconnect_preserve_auto_record = preserve_auto_record
+        QMetaObject.invokeMethod(
+            self, "_gst_main_recording_teardown_before_reconnect", Qt.BlockingQueuedConnection)
+
+    def _marshal_state_close_from_bus_thread(self):
+        QMetaObject.invokeMethod(self, "_gst_main_state_close", Qt.QueuedConnection)
+
+    def _marshal_state_open_from_bus_thread(self):
+        QMetaObject.invokeMethod(self, "_gst_main_state_open", Qt.QueuedConnection)
 
     def pipeline_bus_check(self):
         logger.debug("Pipeline bus check thread started")
         bus = self.pipeline.get_bus()
         timeout_counter = 0
         reconnecting_counter = 0
+
+        def sync_stop_recording_if_needed(kind):
+            if self.is_recording and not self.is_stopping_recording:
+                logger.info(f"Stopping and saving recording due to disconnect ({kind})...")
+                self.auto_record_on_reconnect = True
+                self.is_stopping_recording = True
+                self._marshal_stop_recording_from_bus_thread()
+                logger.debug("Waiting for recording to finish before reconnecting...")
+                wait_start = time.time()
+                while self.is_stopping_recording and (time.time() - wait_start) < 15:
+                    time.sleep(0.5)
+                if self.is_stopping_recording:
+                    logger.warning("Timeout waiting for recording to stop, proceeding with reconnect anyway")
+                    self.is_stopping_recording = False
+            elif self.is_stopping_recording:
+                logger.info("Recording is already being stopped, waiting for it to finish...")
+                wait_start = time.time()
+                while self.is_stopping_recording and (time.time() - wait_start) < 15:
+                    time.sleep(0.5)
+                if self.is_stopping_recording:
+                    logger.warning("Timeout waiting for recording to stop, proceeding with reconnect anyway")
+                    self.is_stopping_recording = False
+
+        def teardown_recording_branch_on_main_if_needed(context):
+            if self.is_recording and not self.is_stopping_recording:
+                logger.warning(
+                    f"Recording still active during reconnect ({context}), removing branch on main thread...")
+                preserve_auto_record = self.auto_record_on_reconnect
+                self._marshal_recording_teardown_from_bus_thread(preserve_auto_record)
+
+        def schedule_reconnect_backoff():
+            nonlocal reconnecting_counter
+            if not self._playback_intent:
+                return
+            reconnecting_counter += 1
+            delay_ms = self._reconnect_backoff_ms(reconnecting_counter)
+            logger.warning(
+                f"Scheduling reconnect on main thread (attempt {reconnecting_counter}, delay {delay_ms} ms)")
+            self.sig_schedule_pipeline_reconnect.emit(delay_ms)
+
         while True:
-            msg = bus.timed_pop_filtered(Gst.CLOCK_TIME_NONE, Gst.MessageType.ERROR | Gst.MessageType.EOS | Gst.MessageType.WARNING | Gst.MessageType.STATE_CHANGED)
+            msg = bus.timed_pop_filtered(
+                Gst.CLOCK_TIME_NONE,
+                Gst.MessageType.ERROR | Gst.MessageType.EOS | Gst.MessageType.WARNING
+                | Gst.MessageType.STATE_CHANGED)
             if msg is None:
+                time.sleep(0.02)
                 continue
             if self.state == VideoState.STATE_CLOSE or self.state == VideoState.STATE_OPEN:
                 timeout_counter = 0
@@ -1206,218 +1399,64 @@ class Video(QOpenGLWidget):
             if msg_type == Gst.MessageType.ERROR:
                 err, debug = msg.parse_error()
                 logger.error(f"❌ GStreamer Error: {err}, Debug: {debug}")
-                # Stop and save recording if active before reconnecting
-                if self.is_recording and not self.is_stopping_recording:
-                    logger.info("Stopping and saving recording due to disconnect (ERROR)...")
-                    # Set flag to auto-restart recording after reconnect
-                    self.auto_record_on_reconnect = True
-                    # Set stopping flag immediately so we don't reset pipeline too early
-                    self.is_stopping_recording = True
-                    # Stop recording (this will save it) - call from main thread via QTimer
-                    QTimer.singleShot(0, self.stop_recording)
-                    # Wait for recording to finish before reconnecting to avoid file corruption
-                    logger.debug("Waiting for recording to finish before reconnecting...")
-                    wait_start = time.time()
-                    while self.is_stopping_recording and (time.time() - wait_start) < 15:
-                        time.sleep(0.5)
-                    if self.is_stopping_recording:
-                        logger.warning("Timeout waiting for recording to stop, proceeding with reconnect anyway")
-                        self.is_stopping_recording = False  # Clear flag if timeout
-                elif self.is_stopping_recording:
-                    logger.info("Recording is already being stopped, waiting for it to finish...")
-                    wait_start = time.time()
-                    while self.is_stopping_recording and (time.time() - wait_start) < 15:
-                        time.sleep(0.5)
-                    if self.is_stopping_recording:
-                        logger.warning("Timeout waiting for recording to stop, proceeding with reconnect anyway")
-                        self.is_stopping_recording = False  # Clear flag if timeout
-                if (self.state == VideoState.STATE_OPEN):
-                    # If recording is active, remove recording elements before resetting pipeline
-                    if self.is_recording and not self.is_stopping_recording:
-                        logger.warning("Recording is active during reconnect, removing recording elements first...")
-                        # Preserve auto_record_on_reconnect flag if it's set
-                        preserve_auto_record = self.auto_record_on_reconnect
-                        # Force stop and remove recording elements immediately
-                        try:
-                            if self.recording_tee_pad and self.tee:
-                                try:
-                                    peer = self.recording_tee_pad.get_peer()
-                                    if peer:
-                                        self.recording_tee_pad.unlink(peer)
-                                    self.recording_tee_pad.set_active(False)
-                                    self.tee.release_request_pad(self.recording_tee_pad)
-                                except Exception as e:
-                                    logger.warning(f"Error releasing tee pad: {e}")
-                                self.recording_tee_pad = None
-                            self._cleanup_recording_elements()
-                            self.is_recording = False
-                            self.is_stopping_recording = False
-                            # Restore auto_record_on_reconnect flag if it was set
-                            if preserve_auto_record:
-                                self.auto_record_on_reconnect = True
-                                logger.info("Preserved auto_record_on_reconnect flag after removing recording elements")
-                            logger.info("Recording elements removed before pipeline reset")
-                        except Exception as e:
-                            logger.error(f"Error removing recording elements: {e}", exc_info=True)
-                    reconnecting_counter += 1
-                    logger.warning(f"Reconnecting (attempt {reconnecting_counter})...")
-                    self.pipeline.set_state(Gst.State.NULL)
-                    self.pipeline.set_state(Gst.State.PLAYING)
-                    time.sleep(1)
-                elif (self.state == VideoState.STATE_CONNECTING):
+                sync_stop_recording_if_needed("ERROR")
+                if self.state == VideoState.STATE_OPEN:
+                    teardown_recording_branch_on_main_if_needed("ERROR")
+                    schedule_reconnect_backoff()
+                elif self.state == VideoState.STATE_CONNECTING:
                     timeout_counter += 1
-                    reconnecting_counter += 1
-                    logger.warning(f"Reconnecting (attempt {reconnecting_counter}, timeout_counter={timeout_counter})...")
-                    self.pipeline.set_state(Gst.State.NULL)
-                    self.pipeline.set_state(Gst.State.PLAYING)
-                    logger.debug(f"Timeout counter: {timeout_counter} over 10")
-                    if timeout_counter > 10:
-                        logger.error("Timeout reached, closing stream...")
-                        self.pipeline.set_state(Gst.State.NULL)
-                        self.__change_state(VideoState.STATE_CLOSE)
-                    time.sleep(1)
+                    if timeout_counter % 10 == 0:
+                        logger.warning(
+                            f"Still waiting for RTSP/connect (timeout_counter={timeout_counter}); "
+                            "continuing backoff reconnect")
+                    schedule_reconnect_backoff()
             elif msg_type == Gst.MessageType.EOS:
-                src_name = "unknown"
-                if hasattr(msg.src, 'name'):
-                    src_name = msg.src.name
+                src_name = getattr(msg.src, "name", "unknown") if msg.src else "unknown"
                 logger.info(f"✅ End of Stream reached from element: {src_name}")
-                # Stop and save recording if active before reconnecting
-                if self.is_recording and not self.is_stopping_recording:
-                    logger.info("Stopping and saving recording due to disconnect (EOS)...")
-                    # Set flag to auto-restart recording after reconnect
-                    self.auto_record_on_reconnect = True
-                    # Set stopping flag immediately so we don't reset pipeline too early
-                    self.is_stopping_recording = True
-                    # Stop recording (this will save it) - call from main thread via QTimer
-                    QTimer.singleShot(0, self.stop_recording)
-                    # Wait for recording to finish before reconnecting to avoid file corruption
-                    logger.debug("Waiting for recording to finish before reconnecting...")
-                    wait_start = time.time()
-                    while self.is_stopping_recording and (time.time() - wait_start) < 15:
-                        time.sleep(0.5)
-                    if self.is_stopping_recording:
-                        logger.warning("Timeout waiting for recording to stop, proceeding with reconnect anyway")
-                        self.is_stopping_recording = False  # Clear flag if timeout
-                elif self.is_stopping_recording:
-                    logger.info("Recording is already being stopped, waiting for it to finish...")
-                    wait_start = time.time()
-                    while self.is_stopping_recording and (time.time() - wait_start) < 15:
-                        time.sleep(0.5)
-                    if self.is_stopping_recording:
-                        logger.warning("Timeout waiting for recording to stop, proceeding with reconnect anyway")
-                        self.is_stopping_recording = False  # Clear flag if timeout
-                if (self.state == VideoState.STATE_OPEN):
-                    # If recording is active, remove recording elements before resetting pipeline
-                    if self.is_recording and not self.is_stopping_recording:
-                        logger.warning("Recording is active during reconnect after EOS, removing recording elements first...")
-                        # Preserve auto_record_on_reconnect flag if it's set
-                        preserve_auto_record = self.auto_record_on_reconnect
-                        # Force stop and remove recording elements immediately
-                        try:
-                            if self.recording_tee_pad and self.tee:
-                                try:
-                                    peer = self.recording_tee_pad.get_peer()
-                                    if peer:
-                                        self.recording_tee_pad.unlink(peer)
-                                    self.recording_tee_pad.set_active(False)
-                                    self.tee.release_request_pad(self.recording_tee_pad)
-                                except Exception as e:
-                                    logger.warning(f"Error releasing tee pad: {e}")
-                                self.recording_tee_pad = None
-                            self._cleanup_recording_elements()
-                            self.is_recording = False
-                            self.is_stopping_recording = False
-                            # Restore auto_record_on_reconnect flag if it was set
-                            if preserve_auto_record:
-                                self.auto_record_on_reconnect = True
-                                logger.info("Preserved auto_record_on_reconnect flag after removing recording elements")
-                            logger.info("Recording elements removed before pipeline reset")
-                        except Exception as e:
-                            logger.error(f"Error removing recording elements: {e}", exc_info=True)
-                    reconnecting_counter += 1
-                    logger.warning(f"Reconnecting after EOS (attempt {reconnecting_counter})...")
-                    self.pipeline.set_state(Gst.State.NULL)
-                    self.pipeline.set_state(Gst.State.PLAYING)
-                    time.sleep(1)
+                sync_stop_recording_if_needed("EOS")
+                if self.state == VideoState.STATE_OPEN:
+                    teardown_recording_branch_on_main_if_needed("EOS")
+                    schedule_reconnect_backoff()
                 else:
                     logger.info("Stream ended, closing...")
-                    self.__change_state(VideoState.STATE_CLOSE)
+                    self._marshal_state_close_from_bus_thread()
             elif msg_type == Gst.MessageType.WARNING:
                 warn, debug = msg.parse_warning()
                 logger.warning(f"⚠️ GStreamer Warning: {warn}, Debug: {debug}")
                 if "Could not read from resource." in str(warn):
-                    # Stop and save recording if active before reconnecting
-                    if self.is_recording and not self.is_stopping_recording:
-                        logger.info("Stopping and saving recording due to disconnect (resource read error)...")
-                        # Set flag to auto-restart recording after reconnect
-                        self.auto_record_on_reconnect = True
-                        # Set stopping flag immediately so we don't reset pipeline too early
-                        self.is_stopping_recording = True
-                        # Stop recording (this will save it) - call from main thread via QTimer
-                        QTimer.singleShot(0, self.stop_recording)
-                        # Wait for recording to finish before reconnecting to avoid file corruption
-                        logger.debug("Waiting for recording to finish before reconnecting...")
-                        wait_start = time.time()
-                        while self.is_stopping_recording and (time.time() - wait_start) < 15:
-                            time.sleep(0.5)
-                        if self.is_stopping_recording:
-                            logger.warning("Timeout waiting for recording to stop, proceeding with reconnect anyway")
-                            self.is_stopping_recording = False  # Clear flag if timeout
-                    elif self.is_stopping_recording:
-                        logger.info("Recording is already being stopped, waiting for it to finish...")
-                        wait_start = time.time()
-                        while self.is_stopping_recording and (time.time() - wait_start) < 15:
-                            time.sleep(0.5)
-                        if self.is_stopping_recording:
-                            logger.warning("Timeout waiting for recording to stop, proceeding with reconnect anyway")
-                            self.is_stopping_recording = False  # Clear flag if timeout
-                    if (self.state == VideoState.STATE_OPEN):
-                        # If recording is active, remove recording elements before resetting pipeline
-                        if self.is_recording and not self.is_stopping_recording:
-                            logger.warning("Recording is active during reconnect after resource error, removing recording elements first...")
-                            # Preserve auto_record_on_reconnect flag if it's set
-                            preserve_auto_record = self.auto_record_on_reconnect
-                            # Force stop and remove recording elements immediately
-                            try:
-                                if self.recording_tee_pad and self.tee:
-                                    try:
-                                        peer = self.recording_tee_pad.get_peer()
-                                        if peer:
-                                            self.recording_tee_pad.unlink(peer)
-                                        self.recording_tee_pad.set_active(False)
-                                        self.tee.release_request_pad(self.recording_tee_pad)
-                                    except Exception as e:
-                                        logger.warning(f"Error releasing tee pad: {e}")
-                                    self.recording_tee_pad = None
-                                self._cleanup_recording_elements()
-                                self.is_recording = False
-                                self.is_stopping_recording = False
-                                # Restore auto_record_on_reconnect flag if it was set
-                                if preserve_auto_record:
-                                    self.auto_record_on_reconnect = True
-                                    logger.info("Preserved auto_record_on_reconnect flag after removing recording elements")
-                                logger.info("Recording elements removed before pipeline reset")
-                            except Exception as e:
-                                logger.error(f"Error removing recording elements: {e}", exc_info=True)
-                        reconnecting_counter += 1
-                        logger.warning(f"Reconnecting after resource read error (attempt {reconnecting_counter})...")
-                        self.pipeline.set_state(Gst.State.NULL)
-                        self.pipeline.set_state(Gst.State.PLAYING)
-                        time.sleep(1)
+                    sync_stop_recording_if_needed("resource read error")
+                    if self.state == VideoState.STATE_OPEN:
+                        teardown_recording_branch_on_main_if_needed("resource read error")
+                        schedule_reconnect_backoff()
+                    elif self.state == VideoState.STATE_CONNECTING:
+                        timeout_counter += 1
+                        if timeout_counter % 10 == 0:
+                            logger.warning(
+                                f"Resource read stall while connecting (timeout_counter="
+                                f"{timeout_counter}); continuing backoff reconnect")
+                        schedule_reconnect_backoff()
             elif msg_type == Gst.MessageType.STATE_CHANGED:
                 old_state, new_state, pending = msg.parse_state_changed()
-                src = msg.src  # The element that changed state
-                logger.debug(f"🔄 State changed: {src.name if hasattr(src, 'name') else 'unknown'}: {old_state} → {new_state} (Pending: {pending})")
+                src = msg.src
+                logger.debug(
+                    f"🔄 State changed: {src.name if hasattr(src, 'name') else 'unknown'}: "
+                    f"{old_state} → {new_state} (Pending: {pending})")
                 if hasattr(src, 'name') and src.name == "rtsp-pipeline" and new_state == Gst.State.PLAYING:
                     timeout_counter = 0
                     reconnecting_counter = 0
                     logger.debug("Pipeline reached PLAYING state, resetting counters")
-                    self.__change_state(VideoState.STATE_OPEN)
+                    self._marshal_state_open_from_bus_thread()
             else:
                 logger.debug(f"📢 Other Message: {msg_type}")
 
     def resizeEvent(self, event):
         print(f"Video resized to: {event.size().width()}x{event.size().height()}")
+        super().resizeEvent(event)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if getattr(self, "_playback_intent", False) and getattr(self, "_video_sink", None):
+            self._attach_video_sink()
 
     def closeEvent(self, event):
         self.close_stream()
