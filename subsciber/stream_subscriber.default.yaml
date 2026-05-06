@@ -14,3 +14,6 @@ influxdb_org: fcclab
 influxdb_bucket: fcclab
 influxdb_token: fcclab_token
 influxdb_measurement: stream_metrics
+# Reliable embed on Ubuntu: auto tries xvimagesink then ximagesink then GL. Under Wayland, Qt defaults to X11 (see qt_use_xcb_under_wayland).
+video_sink: auto
+qt_use_xcb_under_wayland: true

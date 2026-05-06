@@ -18,7 +18,7 @@ from logging.handlers import RotatingFileHandler
 
 import sys
 from PyQt5.QtCore import Qt
-from PyQt5.QtWidgets import QApplication, QWidget, QVBoxLayout, QPushButton, QOpenGLWidget
+from PyQt5.QtWidgets import QApplication, QWidget, QVBoxLayout, QPushButton
 import gi
 gi.require_version('Gst', '1.0')
 gi.require_version('GstVideo', '1.0')
@@ -51,7 +51,10 @@ DEFAULT_SETTINGS = {
     "influxdb_org": "fcclab",
     "influxdb_bucket": "fcclab",
     "influxdb_token": "fcclab_token",
-    "influxdb_measurement": "stream_metrics"
+    "influxdb_measurement": "stream_metrics",
+    # auto: pick best available; under Wayland use qt_use_xcb_under_wayland so embed works
+    "video_sink": "auto",
+    "qt_use_xcb_under_wayland": True,
 }
 
 # Configure logging
@@ -103,6 +106,81 @@ def setup_logging(log_file=None, log_level=logging.DEBUG):
 # Initialize logging
 logger = setup_logging()
 
+
+def _bootstrap_qt_for_gstreamer_embed():
+    """GStreamer VideoOverlay + Qt winId() is unreliable on native Wayland; use Xcb (XWayland) by default."""
+    if os.environ.get("QT_QPA_PLATFORM"):
+        return
+    if os.environ.get("XDG_SESSION_TYPE", "").lower() != "wayland":
+        return
+    enabled = DEFAULT_SETTINGS.get("qt_use_xcb_under_wayland", True)
+    cfg = None
+    try:
+        if os.path.exists(CONFIG_FILE):
+            with open(CONFIG_FILE, "r") as fh:
+                cfg = yaml.safe_load(fh)
+        elif os.path.exists(DEFAULT_CONFIG_FILE):
+            with open(DEFAULT_CONFIG_FILE, "r") as fh:
+                cfg = yaml.safe_load(fh)
+    except Exception:
+        cfg = None
+    if cfg and "qt_use_xcb_under_wayland" in cfg:
+        enabled = bool(cfg["qt_use_xcb_under_wayland"])
+    if not enabled:
+        return
+    os.environ["QT_QPA_PLATFORM"] = "xcb"
+    logger.info(
+        "Wayland session: using QT_QPA_PLATFORM=xcb so GStreamer can embed into the Qt window "
+        "(set qt_use_xcb_under_wayland: false in stream_subscriber.yaml to use native Wayland Qt instead)")
+
+
+def _display_sink_candidates(settings):
+    """Ordered list of element factory names to try for embedded video."""
+    pref = (settings.get("video_sink") or "auto").strip().lower()
+    session = os.environ.get("XDG_SESSION_TYPE", "").lower()
+    fallbacks = ["xvimagesink", "ximagesink", "glimagesink", "autovideosink"]
+    if pref == "auto":
+        if session == "wayland":
+            # With QT_QPA_PLATFORM=xcb, X11-style sinks work; still prefer non-GL first
+            return ["xvimagesink", "ximagesink", "glimagesink", "autovideosink"]
+        return ["xvimagesink", "ximagesink", "glimagesink", "autovideosink"]
+    if pref in fallbacks:
+        return [pref] + [n for n in fallbacks if n != pref]
+    return [pref] + fallbacks
+
+
+def _make_display_sink(settings, win_id_init=0):
+    """Create the best available videosink; returns (element_or_none, factory_name)."""
+    last = []
+    for factory in _display_sink_candidates(settings):
+        el = Gst.ElementFactory.make(factory, "sink")
+        if el is None:
+            last.append(f"{factory}: missing")
+            continue
+        try:
+            el.set_property("sync", False)
+        except Exception:
+            pass
+        for prop, val in (("force-aspect-ratio", True),):
+            try:
+                el.set_property(prop, val)
+            except Exception:
+                pass
+        try:
+            GstVideo.VideoOverlay.set_window_handle(el, int(win_id_init))
+            if win_id_init:
+                GstVideo.VideoOverlay.expose(el)
+        except Exception:
+            try:
+                el.set_window_handle(int(win_id_init))
+            except Exception as e:
+                last.append(f"{factory}: handle init {e}")
+        logger.info(f"Display sink: {factory}")
+        return el, factory
+    logger.error("No display sink could be created. Tried: %s", "; ".join(last) or "none")
+    return None, ""
+
+
 # Global URLs variable - will be initialized from config
 URLs = []
 
@@ -118,7 +196,7 @@ class VideoState(Enum):
     STATE_CONNECTING = 1
     STATE_OPEN = 2
 
-class Video(QOpenGLWidget):
+class Video(QWidget):
     
     sig_state_changed = pyqtSignal(VideoState)
     sig_recording_changed = pyqtSignal(str)  # Signal for recording state changes: "recording", "saving", "stopped"
@@ -160,8 +238,10 @@ class Video(QOpenGLWidget):
         
         decoder = Gst.ElementFactory.make("avdec_h264", "decoder")
         convert = Gst.ElementFactory.make("videoconvert", "convert")
-        sink = Gst.ElementFactory.make("glimagesink", "sink")
+        settings_vp = load_settings()
+        sink, sink_factory = _make_display_sink(settings_vp, int(self.winId()))
         self._video_sink = sink
+        self._video_sink_factory = sink_factory or "unknown"
 
         if not all([self.source, rtph264depay, h264parse, self.tee, decoder, convert, sink]):
             logger.error("Failed to create GStreamer elements")
@@ -172,18 +252,22 @@ class Video(QOpenGLWidget):
             if not self.tee: missing.append("tee")
             if not decoder: missing.append("avdec_h264")
             if not convert: missing.append("videoconvert")
-            if not sink: missing.append("glimagesink")
+            if not sink: missing.append(f"videosink ({', '.join(_display_sink_candidates(settings_vp))})")
             logger.error(f"Missing elements: {', '.join(missing)}")
         else:
             logger.debug("All GStreamer elements created successfully")
+
+        if sink is None:
+            raise RuntimeError(
+                "No video display sink — install GStreamer plugins (e.g. gstreamer1.0-plugins-good, "
+                "gstreamer1.0-plugins-base) or set video_sink in stream_subscriber.yaml.")
 
         self.source.set_property("latency", 100)  # Adjust latency for real-time streaming
         logger.debug("Set rtspsrc latency to 100ms")
         
         # Configure RTSP transport (force TCP by default to avoid UDP timeouts)
         try:
-            settings = load_settings()
-            transport = settings.get("rtsp_transport", "tcp")
+            transport = settings_vp.get("rtsp_transport", "tcp")
             if transport == "tcp":
                 self.source.set_property("protocols", 4)  # 4 = GstRTSPLowerTrans.TCP
                 logger.info("Forcing RTSP transport to TCP")
@@ -197,10 +281,8 @@ class Video(QOpenGLWidget):
         # self.source.set_property("tcp-timeout", 2000000)
         # self.source.set_property("timeout", 2000000)
 
-        sink.set_property("force-aspect-ratio", True)
-        sink.set_property("sync", False)
-        sink.set_window_handle(self.winId())
-        logger.debug("Configured glimagesink: force-aspect-ratio=True, sync=False")
+        self._apply_sink_overlay_handle(sink, int(self.winId()))
+        logger.debug(f"Configured display sink ({self._video_sink_factory}), sync=False, aspect-ratio=best-effort")
 
         self.pipeline.add(self.source)
         self.pipeline.add(rtph264depay)
@@ -285,7 +367,7 @@ class Video(QOpenGLWidget):
             if result == Gst.IteratorResult.OK:
                 elements.append(element.get_name())
         logger.info(f"Elements: {' -> '.join(elements)}")
-        logger.info(f"Pipeline description: rtspsrc -> rtph264depay -> h264parse -> avdec_h264 -> videoconvert -> glimagesink")
+        logger.info(f"Pipeline description: rtspsrc -> rtph264depay -> h264parse -> avdec_h264 -> videoconvert -> {self._video_sink_factory}")
         logger.info("="*80)
         logger.debug("Pipeline creation completed")
 
@@ -354,17 +436,33 @@ class Video(QOpenGLWidget):
                 self.__change_state(VideoState.STATE_CLOSE)
                 logger.info("Stream closed successfully")
 
+    def _apply_sink_overlay_handle(self, sink, wid):
+        """Set native window handle on the video sink (VideoOverlay preferred for glimagesink)."""
+        if sink is None:
+            return False
+        try:
+            GstVideo.VideoOverlay.set_window_handle(sink, wid)
+            if wid:
+                GstVideo.VideoOverlay.expose(sink)
+            return True
+        except Exception as e:
+            logger.debug(f"GstVideo.VideoOverlay unavailable ({e}); using set_window_handle")
+            try:
+                sink.set_window_handle(wid)
+                return True
+            except Exception as e2:
+                logger.warning(f"glimagesink window handle failed: {e2}")
+                return False
+
     def _detach_video_sink(self):
         """Unbind GL sink from the Qt window before destroying the pipeline (avoids compositor/GPU crashes)."""
         sink = getattr(self, "_video_sink", None)
         if sink is None and getattr(self, "pipeline", None):
             sink = self.pipeline.get_by_name("sink")
-        if sink is None:
-            return
         try:
-            sink.set_window_handle(0)
+            self._apply_sink_overlay_handle(sink, 0)
         except Exception as e:
-            logger.debug(f"detach glimagesink window handle: {e}")
+            logger.debug(f"detach glimagesink: {e}")
 
     def _attach_video_sink(self):
         """Bind glimagesink to this widget — required again after NULL->PLAYING or window changes."""
@@ -373,14 +471,12 @@ class Video(QOpenGLWidget):
             sink = self.pipeline.get_by_name("sink")
         if sink is None:
             return
-        try:
-            wid = int(self.winId())
-            if wid == 0:
-                logger.warning("Video widget winId is 0; GL sink may stay black until widget is shown")
-            sink.set_window_handle(wid)
-            logger.debug(f"glimagesink window handle set to {wid}")
-        except Exception as e:
-            logger.warning(f"attach glimagesink failed: {e}")
+        wid = int(self.winId())
+        if wid == 0:
+            logger.warning("Video widget winId is 0; sink may stay black until widget is shown")
+        ok = self._apply_sink_overlay_handle(sink, wid)
+        logger.debug(f"video sink overlay handle wid={wid} ok={ok}")
+        self.update()
 
     def _calculate_metrics(self):
         """Calculate metrics and emit signal."""
@@ -1209,6 +1305,9 @@ class Video(QOpenGLWidget):
 
     def __init__(self):
         super().__init__()
+        # Native window embedding for glimagesink (QOpenGLWidget uses an internal FBO — video stays black)
+        self.setAttribute(Qt.WA_NativeWindow, True)
+        self.setAttribute(Qt.WA_OpaquePaintEvent, True)
 
         # palette = self.palette()
         # palette.setColor(QPalette.Window, QColor(255, 0, 0))  # RGB color
@@ -1297,6 +1396,7 @@ class Video(QOpenGLWidget):
             logger.debug("Ignoring pipeline OPEN (shutdown or closed)")
             return
         self.__change_state(VideoState.STATE_OPEN)
+        QTimer.singleShot(0, self._attach_video_sink)
 
     @pyqtSlot()
     def _gst_main_state_close(self):
@@ -1452,6 +1552,12 @@ class Video(QOpenGLWidget):
     def resizeEvent(self, event):
         print(f"Video resized to: {event.size().width()}x{event.size().height()}")
         super().resizeEvent(event)
+        sink = getattr(self, "_video_sink", None)
+        if sink and getattr(self, "_playback_intent", False) and int(self.winId()) != 0:
+            try:
+                GstVideo.VideoOverlay.expose(sink)
+            except Exception:
+                pass
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -1925,6 +2031,7 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(timeout_miliseconds, lambda: self.statusBar().clearMessage())
 
 if __name__ == '__main__':
+    _bootstrap_qt_for_gstreamer_embed()
     app = QApplication(sys.argv)
 
     FONT_SIZE_PIXELS = int(QWidget().font().pointSize() * app.primaryScreen().logicalDotsPerInch() / 72.0)
