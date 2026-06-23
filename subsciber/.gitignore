@@ -5,3 +5,4 @@ stream_subscriber.yaml
 recordings/
 *.log*
 __pycache__/
+miniconda3/
