@@ -161,7 +161,7 @@ def _make_display_sink(settings, win_id_init=0):
             el.set_property("sync", False)
         except Exception:
             pass
-        for prop, val in (("force-aspect-ratio", True),):
+        for prop, val in (("force-aspect-ratio", False),):
             try:
                 el.set_property(prop, val)
             except Exception:
@@ -238,12 +238,14 @@ class Video(QWidget):
         
         decoder = Gst.ElementFactory.make("avdec_h264", "decoder")
         convert = Gst.ElementFactory.make("videoconvert", "convert")
+        scale = Gst.ElementFactory.make("videoscale", "scale")
+        self._scale_capsfilter = Gst.ElementFactory.make("capsfilter", "scale_caps")
         settings_vp = load_settings()
         sink, sink_factory = _make_display_sink(settings_vp, int(self.winId()))
         self._video_sink = sink
         self._video_sink_factory = sink_factory or "unknown"
 
-        if not all([self.source, rtph264depay, h264parse, self.tee, decoder, convert, sink]):
+        if not all([self.source, rtph264depay, h264parse, self.tee, decoder, convert, scale, self._scale_capsfilter, sink]):
             logger.error("Failed to create GStreamer elements")
             missing = []
             if not self.source: missing.append("rtspsrc")
@@ -252,6 +254,8 @@ class Video(QWidget):
             if not self.tee: missing.append("tee")
             if not decoder: missing.append("avdec_h264")
             if not convert: missing.append("videoconvert")
+            if not scale: missing.append("videoscale")
+            if not self._scale_capsfilter: missing.append("capsfilter")
             if not sink: missing.append(f"videosink ({', '.join(_display_sink_candidates(settings_vp))})")
             logger.error(f"Missing elements: {', '.join(missing)}")
         else:
@@ -281,6 +285,12 @@ class Video(QWidget):
         # self.source.set_property("tcp-timeout", 2000000)
         # self.source.set_property("timeout", 2000000)
 
+        try:
+            scale.set_property("add-borders", True)
+        except Exception:
+            pass
+        self._sync_video_scale_caps()
+
         self._apply_sink_overlay_handle(sink, int(self.winId()))
         logger.debug(f"Configured display sink ({self._video_sink_factory}), sync=False, aspect-ratio=best-effort")
 
@@ -290,6 +300,8 @@ class Video(QWidget):
         self.pipeline.add(self.tee)
         self.pipeline.add(decoder)
         self.pipeline.add(convert)
+        self.pipeline.add(scale)
+        self.pipeline.add(self._scale_capsfilter)
         self.pipeline.add(sink)
 
         rtph264depay.link(h264parse)
@@ -301,7 +313,9 @@ class Video(QWidget):
         tee_src_pad.link(decoder_sink_pad)
         
         decoder.link(convert)
-        convert.link(sink)
+        convert.link(scale)
+        scale.link(self._scale_capsfilter)
+        self._scale_capsfilter.link(sink)
         
         # Add probe to count frames for FPS calculation
         sink_pad = convert.get_static_pad("sink")
@@ -367,7 +381,7 @@ class Video(QWidget):
             if result == Gst.IteratorResult.OK:
                 elements.append(element.get_name())
         logger.info(f"Elements: {' -> '.join(elements)}")
-        logger.info(f"Pipeline description: rtspsrc -> rtph264depay -> h264parse -> avdec_h264 -> videoconvert -> {self._video_sink_factory}")
+        logger.info(f"Pipeline description: rtspsrc -> rtph264depay -> h264parse -> avdec_h264 -> videoconvert -> videoscale -> capsfilter -> {self._video_sink_factory}")
         logger.info("="*80)
         logger.debug("Pipeline creation completed")
 
@@ -436,6 +450,34 @@ class Video(QWidget):
                 self.__change_state(VideoState.STATE_CLOSE)
                 logger.info("Stream closed successfully")
 
+    def _overlay_pixel_size(self):
+        """Widget size in native/drawable pixels (HiDPI-aware)."""
+        dpr = max(1.0, self.devicePixelRatioF())
+        return max(1, int(self.width() * dpr)), max(1, int(self.height() * dpr))
+
+    def _sync_video_scale_caps(self):
+        """Scale decoded frames to the widget size before the display sink."""
+        capsfilter = getattr(self, "_scale_capsfilter", None)
+        if capsfilter is None:
+            return
+        w, h = self._overlay_pixel_size()
+        capsfilter.set_property("caps", Gst.Caps.from_string(f"video/x-raw,width={w},height={h}"))
+
+    def _sync_video_overlay_geometry(self):
+        """Tell the GStreamer overlay the drawable size so video scales with the widget."""
+        sink = getattr(self, "_video_sink", None)
+        if sink is None or int(self.winId()) == 0:
+            return
+        w, h = self._overlay_pixel_size()
+        if w <= 0 or h <= 0:
+            return
+        self._sync_video_scale_caps()
+        try:
+            GstVideo.VideoOverlay.set_render_rectangle(sink, 0, 0, w, h)
+            GstVideo.VideoOverlay.expose(sink)
+        except Exception as e:
+            logger.debug(f"video overlay geometry: {e}")
+
     def _apply_sink_overlay_handle(self, sink, wid):
         """Set native window handle on the video sink (VideoOverlay preferred for glimagesink)."""
         if sink is None:
@@ -443,12 +485,14 @@ class Video(QWidget):
         try:
             GstVideo.VideoOverlay.set_window_handle(sink, wid)
             if wid:
-                GstVideo.VideoOverlay.expose(sink)
+                self._sync_video_overlay_geometry()
             return True
         except Exception as e:
             logger.debug(f"GstVideo.VideoOverlay unavailable ({e}); using set_window_handle")
             try:
                 sink.set_window_handle(wid)
+                if wid:
+                    self._sync_video_overlay_geometry()
                 return True
             except Exception as e2:
                 logger.warning(f"glimagesink window handle failed: {e2}")
@@ -1308,6 +1352,7 @@ class Video(QWidget):
         # Native window embedding for glimagesink (QOpenGLWidget uses an internal FBO — video stays black)
         self.setAttribute(Qt.WA_NativeWindow, True)
         self.setAttribute(Qt.WA_OpaquePaintEvent, True)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
 
         # palette = self.palette()
         # palette.setColor(QPalette.Window, QColor(255, 0, 0))  # RGB color
@@ -1397,6 +1442,7 @@ class Video(QWidget):
             return
         self.__change_state(VideoState.STATE_OPEN)
         QTimer.singleShot(0, self._attach_video_sink)
+        QTimer.singleShot(50, self._sync_video_overlay_geometry)
 
     @pyqtSlot()
     def _gst_main_state_close(self):
@@ -1550,19 +1596,15 @@ class Video(QWidget):
                 logger.debug(f"📢 Other Message: {msg_type}")
 
     def resizeEvent(self, event):
-        print(f"Video resized to: {event.size().width()}x{event.size().height()}")
         super().resizeEvent(event)
-        sink = getattr(self, "_video_sink", None)
-        if sink and getattr(self, "_playback_intent", False) and int(self.winId()) != 0:
-            try:
-                GstVideo.VideoOverlay.expose(sink)
-            except Exception:
-                pass
+        self._sync_video_overlay_geometry()
 
     def showEvent(self, event):
         super().showEvent(event)
-        if getattr(self, "_playback_intent", False) and getattr(self, "_video_sink", None):
-            self._attach_video_sink()
+        if getattr(self, "_video_sink", None):
+            if getattr(self, "_playback_intent", False):
+                self._attach_video_sink()
+            QTimer.singleShot(0, self._sync_video_overlay_geometry)
 
     def closeEvent(self, event):
         self.close_stream()
@@ -1749,14 +1791,22 @@ class Player(QWidget):
         # self.setPalette(palette)
         # self.setAutoFillBackground(True)  # Required for palette to take effect
 
-        layout = QVBoxLayout()
-        self.setLayout(layout)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
 
         self.widgetOpen = Open(initial_url_index, urls_list)
-        self.layout().addWidget(self.widgetOpen)
+        self.widgetOpen.setFixedHeight(FONT_SIZE_PIXELS * 4)
+        layout.addWidget(self.widgetOpen)
 
         self.widgetVideo = Video()
-        self.layout().addWidget(self.widgetVideo)
+        self.frame_player.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        frame_layout = QVBoxLayout(self.frame_player)
+        frame_layout.setContentsMargins(0, 0, 0, 0)
+        frame_layout.addWidget(self.widgetVideo)
+        layout.addWidget(self.frame_player, 1)
 
         pushButton_Open = self.widgetOpen.findChild(QPushButton, "pushButton_Open")
         pushButton_Open.clicked.connect(self.on_open_button_clicked)
@@ -1932,12 +1982,6 @@ class Player(QWidget):
                 QTimer.singleShot(timeout_milliseconds, lambda: parent.statusBar().clearMessage())
 
     def resizeEvent(self, event):
-        print(f"Player resized to: {event.size().width()}x{event.size().height()}")
-
-        self.widgetOpen.setGeometry(0, 0, self.width(), FONT_SIZE_PIXELS * 4)
-        self.frame_player.setGeometry(0, FONT_SIZE_PIXELS * 4, event.size().width(), event.size().height() - self.widgetOpen.height() - int(FONT_SIZE_PIXELS + FONT_SIZE_PIXELS/2))
-        self.widgetVideo.setGeometry(0, FONT_SIZE_PIXELS * 4, event.size().width(), event.size().height() - self.widgetOpen.height() - int(FONT_SIZE_PIXELS + FONT_SIZE_PIXELS/2))
-
         super().resizeEvent(event)
     
     def closeEvent(self, event):
@@ -1961,7 +2005,13 @@ class MainWindow(QMainWindow):
         
         # Use global URLs (already loaded in main)
         self.player0 = Player(url_index, URLs)
-        self.layout().addWidget(self.player0)
+        central = self.centralWidget()
+        if central.layout() is None:
+            central_layout = QVBoxLayout(central)
+            central_layout.setContentsMargins(0, 0, 0, 0)
+        else:
+            central_layout = central.layout()
+        central_layout.addWidget(self.player0)
 
         # self.player1 = Player()
         # self.layout().addWidget(self.player1)
@@ -2018,10 +2068,6 @@ class MainWindow(QMainWindow):
         event.accept()
 
     def resizeEvent(self, event):
-        print(f"MainWindow resized to: {event.size().width()}x{event.size().height()}")
-        self.player0.setGeometry(0, 0, int(event.size().width()), int(event.size().height()))
-        # self.player0.setGeometry(0, 0, int(event.size().width()), int(event.size().height()/2))
-        # self.player1.setGeometry(0, int(event.size().height()/2), int(event.size().width()), int(event.size().height()/2))
         super().resizeEvent(event)
     
     def show_status_bar(self, message, timeout_miliseconds=None):
