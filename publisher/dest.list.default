@@ -1,0 +1,6 @@
+# Named destinations for video-publisher.py (shipped defaults)
+# Copied to dest.list on first run. Edit dest.list for local overrides.
+# Format: label  url
+#
+stream  rtmp://10.1.106.210:1935/stream
+local   rtmp://127.0.0.1:1935/stream

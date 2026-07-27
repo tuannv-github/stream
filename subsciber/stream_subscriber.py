@@ -15,6 +15,7 @@ from pathlib import Path
 from datetime import datetime
 import logging
 from logging.handlers import RotatingFileHandler
+from urllib.parse import urlparse
 
 import sys
 from PyQt5.QtCore import Qt
@@ -105,6 +106,28 @@ def setup_logging(log_file=None, log_level=logging.DEBUG):
 
 # Initialize logging
 logger = setup_logging()
+
+
+def to_playable_url(url):
+    """
+    Convert a public subscribe URL to a GStreamer-playable location.
+
+    Public form:  http://10.1.106.210/
+    Playable:     rtsp://10.1.106.210:8554/stream
+    """
+    if not url:
+        return url
+    parsed = urlparse(url)
+    scheme = (parsed.scheme or "").lower()
+    if scheme in ("http", "https"):
+        host = parsed.hostname or "10.1.106.210"
+        path = parsed.path if parsed.path and parsed.path != "/" else "/stream"
+        if not path.startswith("/"):
+            path = f"/{path}"
+        playable = f"rtsp://{host}:8554{path}"
+        logger.info(f"Mapped public URL {url} -> {playable}")
+        return playable
+    return url
 
 
 def _bootstrap_qt_for_gstreamer_embed():
@@ -394,9 +417,10 @@ class Video(QWidget):
         self._playback_intent = True
         url = URLs[URL_index]["url"]
         url_name = URLs[URL_index].get("name", "Unknown")
+        playable_url = to_playable_url(url)
         logger.info(f"Opening stream: {url_name} at URL: {url}")
-        self.source.set_property("location", url)
-        logger.debug(f"Set rtspsrc location to: {url}")
+        self.source.set_property("location", playable_url)
+        logger.debug(f"Set rtspsrc location to: {playable_url}")
         # Reset bitrate counters for new stream
         self.bytes_received = 0
         self.bitrate_last_bytes = 0

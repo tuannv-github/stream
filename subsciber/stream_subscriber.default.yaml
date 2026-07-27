@@ -1,8 +1,6 @@
 urls:
-  - url: rtsp://10.1.101.210:8554/live/stream/kobuki
-    name: Stream Kuboki
-  - url: rtsp://10.1.106.210:8554/stream/go2/front
-    name: Stream Go2 Front
+  - url: http://10.1.106.210/
+    name: Stream
 url_index: 0
 window_x: null
 window_y: null

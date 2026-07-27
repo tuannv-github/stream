@@ -1,0 +1,3 @@
+dest.list
+__pycache__/
+*.pyc
