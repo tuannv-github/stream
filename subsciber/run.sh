@@ -22,4 +22,7 @@ export GST_PLUGIN_SYSTEM_PATH="$CONDA_PREFIX/lib/gstreamer-1.0"
 export QT_PLUGIN_PATH="$CONDA_PREFIX/plugins"
 unset QT_QPA_PLATFORM_PLUGIN_PATH
 
+# Prefer project dir so ui/*.ui and configs resolve when launched via ./run.sh
+cd "$SCRIPT_DIR" || exit 1
+
 exec python "$SCRIPT_DIR/stream_subscriber.py" "$@"

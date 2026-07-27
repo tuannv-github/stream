@@ -2,3 +2,6 @@ PyQt5
 PyGObject
 influxdb-client
 PyYAML
+fastapi
+uvicorn[standard]
+pydantic

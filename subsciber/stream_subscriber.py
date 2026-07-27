@@ -2005,6 +2005,181 @@ class Player(QWidget):
                 from PyQt5.QtCore import QTimer
                 QTimer.singleShot(timeout_milliseconds, lambda: parent.statusBar().clearMessage())
 
+    # ------------------------------------------------------------------
+    # REST API control surface (must run on Qt GUI thread)
+    # ------------------------------------------------------------------
+
+    def _combo(self):
+        return self.widgetOpen.findChild(QComboBox, "comboBox_URL")
+
+    def _refresh_topic_combo(self, select_index=None):
+        combo = self._combo()
+        if combo is None:
+            return
+        current = combo.currentIndex() if select_index is None else select_index
+        combo.blockSignals(True)
+        combo.clear()
+        combo.addItems([u.get("name", u.get("url", f"topic-{i}")) for i, u in enumerate(self.urls_list)])
+        if self.urls_list:
+            combo.setCurrentIndex(max(0, min(current, len(self.urls_list) - 1)))
+        combo.blockSignals(False)
+
+    def _resolve_topic_index(self, index=None, name=None):
+        if index is not None:
+            if not (0 <= index < len(self.urls_list)):
+                raise ValueError(f"Topic index out of range: {index}")
+            return index
+        if name is not None:
+            for i, item in enumerate(self.urls_list):
+                if item.get("name") == name:
+                    return i
+            raise ValueError(f"Topic name not found: {name}")
+        combo = self._combo()
+        return combo.currentIndex() if combo is not None else 0
+
+    def api_list_topics(self):
+        return [
+            {"index": i, "name": u.get("name", ""), "url": u.get("url", "")}
+            for i, u in enumerate(self.urls_list)
+        ]
+
+    def api_get_status(self):
+        combo = self._combo()
+        idx = combo.currentIndex() if combo is not None else 0
+        if idx < 0 or idx >= len(self.urls_list):
+            idx = 0
+        item = self.urls_list[idx] if self.urls_list else {"name": "", "url": ""}
+        state = getattr(self.widgetVideo, "state", VideoState.STATE_CLOSE)
+        return {
+            "state": state.name if hasattr(state, "name") else str(state),
+            "recording": bool(getattr(self.widgetVideo, "is_recording", False)),
+            "publishing": bool(self.is_publishing_continuous),
+            "current_index": idx,
+            "current_name": item.get("name", ""),
+            "current_url": item.get("url", ""),
+            "fps": float(getattr(self, "moving_average_fps", 0.0) or 0.0),
+            "bitrate_mbps": float(self.widgetVideo.get_bitrate_mbps()) if hasattr(self.widgetVideo, "get_bitrate_mbps") else 0.0,
+            "topics": self.api_list_topics(),
+        }
+
+    def api_add_topic(self, name, url):
+        name = (name or "").strip()
+        url = (url or "").strip()
+        if not name or not url:
+            raise ValueError("Both name and url are required")
+        for item in self.urls_list:
+            if item.get("url") == url or item.get("name") == name:
+                raise ValueError(f"Topic already exists: {name} / {url}")
+        self.urls_list.append({"name": name, "url": url})
+        # Keep global URLs in sync if this is a different list object
+        if self.urls_list is not URLs:
+            URLs.clear()
+            URLs.extend(self.urls_list)
+        self._refresh_topic_combo(select_index=len(self.urls_list) - 1)
+        settings = load_settings()
+        settings["urls"] = list(self.urls_list)
+        settings["url_index"] = len(self.urls_list) - 1
+        save_settings(settings)
+        logger.info(f"API added topic [{name}] {url}")
+        return {"message": f"Added topic '{name}'", "index": len(self.urls_list) - 1}
+
+    def api_remove_topic(self, index):
+        if not (0 <= index < len(self.urls_list)):
+            raise ValueError(f"Topic index out of range: {index}")
+        if self.widgetVideo.state != VideoState.STATE_CLOSE:
+            raise ValueError("Close the stream before removing a topic")
+        removed = self.urls_list.pop(index)
+        if self.urls_list is not URLs:
+            URLs.clear()
+            URLs.extend(self.urls_list)
+        self._refresh_topic_combo(select_index=min(index, max(0, len(self.urls_list) - 1)))
+        settings = load_settings()
+        settings["urls"] = list(self.urls_list)
+        settings["url_index"] = self._combo().currentIndex() if self._combo() else 0
+        save_settings(settings)
+        logger.info(f"API removed topic {removed}")
+        return {"message": f"Removed topic '{removed.get('name', index)}'"}
+
+    def api_select_topic(self, index=None, name=None):
+        if self.widgetVideo.state != VideoState.STATE_CLOSE:
+            raise ValueError("Close the stream before selecting a different topic")
+        idx = self._resolve_topic_index(index=index, name=name)
+        combo = self._combo()
+        if combo is not None:
+            combo.setCurrentIndex(idx)
+        settings = load_settings()
+        settings["url_index"] = idx
+        save_settings(settings)
+        item = self.urls_list[idx]
+        return {"message": f"Selected topic '{item.get('name')}'", "index": idx}
+
+    def api_open(self, index=None, name=None):
+        if self.widgetVideo.state in (VideoState.STATE_OPEN, VideoState.STATE_CONNECTING):
+            raise ValueError("Stream is already open or connecting; close it first")
+        if not self.urls_list:
+            raise ValueError("No topics configured")
+        idx = self._resolve_topic_index(index=index, name=name)
+        combo = self._combo()
+        if combo is not None:
+            combo.setCurrentIndex(idx)
+        settings = load_settings()
+        settings["url_index"] = idx
+        save_settings(settings)
+        self.widgetVideo.open_stream(idx)
+        item = self.urls_list[idx]
+        return {"message": f"Opening '{item.get('name')}'", "index": idx}
+
+    def api_close(self):
+        if self.widgetVideo.state == VideoState.STATE_CLOSE:
+            return {"message": "Stream already closed"}
+        self.widgetVideo.close_stream()
+        return {"message": "Stream closed"}
+
+    def api_record_start(self, path=None):
+        if self.widgetVideo.state != VideoState.STATE_OPEN:
+            raise ValueError("Stream must be open to start recording")
+        if self.widgetVideo.is_recording:
+            raise ValueError("Already recording")
+        if path:
+            self.widgetVideo.start_recording(path)
+        else:
+            self.widgetVideo.start_recording()
+        return {"message": "Recording started"}
+
+    def api_record_stop(self):
+        if not self.widgetVideo.is_recording:
+            raise ValueError("Not currently recording")
+        self.widgetOpen.pushButton_Record.setText("Saving...")
+        self.widgetOpen.pushButton_Record.setStyleSheet("background-color: orange; color: white;")
+        self.widgetOpen.pushButton_Record.setEnabled(False)
+        QApplication.processEvents()
+        QTimer.singleShot(10, self.widgetVideo.stop_recording)
+        return {"message": "Recording stop requested"}
+
+    def api_publish_start(self):
+        if self.is_publishing_continuous:
+            return {"message": "Publishing already active"}
+        if not self.write_api or not INFLUXDB_AVAILABLE:
+            raise ValueError("InfluxDB is not available")
+        self.is_publishing_continuous = True
+        self.widgetOpen.pushButton_Publish.setText("Stop Publishing")
+        self.widgetVideo.start_metrics_timer()
+        try:
+            self.publish_metrics(self.widgetVideo.get_fps(), self.widgetVideo.get_bitrate_mbps())
+        except Exception as e:
+            self.is_publishing_continuous = False
+            self.widgetOpen.pushButton_Publish.setText("Publish to DB")
+            raise ValueError(f"Failed to start publishing: {e}") from e
+        return {"message": "Publishing started"}
+
+    def api_publish_stop(self):
+        if not self.is_publishing_continuous:
+            return {"message": "Publishing already stopped"}
+        self.is_publishing_continuous = False
+        self.widgetOpen.pushButton_Publish.setText("Publish to DB")
+        self.widgetVideo.stop_metrics_timer()
+        return {"message": "Publishing stopped"}
+
     def resizeEvent(self, event):
         super().resizeEvent(event)
     
@@ -2101,8 +2276,17 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(timeout_miliseconds, lambda: self.statusBar().clearMessage())
 
 if __name__ == '__main__':
+    import argparse
+    from api_server import DEFAULT_API_HOST, DEFAULT_API_PORT, StreamControlBridge, start_api_server
+
+    parser = argparse.ArgumentParser(description="Stream subscriber with optional REST control API")
+    parser.add_argument("--api-host", default=DEFAULT_API_HOST, help=f"REST API bind host (default: {DEFAULT_API_HOST})")
+    parser.add_argument("--api-port", type=int, default=DEFAULT_API_PORT, help=f"REST API port (default: {DEFAULT_API_PORT})")
+    parser.add_argument("--no-api", action="store_true", help="Disable the REST/Swagger control API")
+    args, qt_args = parser.parse_known_args()
+
     _bootstrap_qt_for_gstreamer_embed()
-    app = QApplication(sys.argv)
+    app = QApplication([sys.argv[0], *qt_args])
 
     FONT_SIZE_PIXELS = int(QWidget().font().pointSize() * app.primaryScreen().logicalDotsPerInch() / 72.0)
     logger.info(f"FONT_SIZE_PIXELS: {FONT_SIZE_PIXELS}")
@@ -2116,4 +2300,20 @@ if __name__ == '__main__':
     
     window = MainWindow()
     window.show()
+
+    if not args.no_api:
+        try:
+            bridge = StreamControlBridge(window.player0)
+            _thread, _server, docs_urls = start_api_server(
+                bridge, host=args.api_host, port=args.api_port
+            )
+            # Prefer a LAN IP in the status bar when bound on all interfaces
+            status_url = next(
+                (u for u in docs_urls if not u.startswith("http://127.0.0.1")),
+                docs_urls[0] if docs_urls else f"http://127.0.0.1:{args.api_port}/docs",
+            )
+            window.show_status_bar(f"REST API {status_url}", 12000)
+        except Exception as e:
+            logger.error(f"Failed to start control API: {e}")
+
     sys.exit(app.exec_())

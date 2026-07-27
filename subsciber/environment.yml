@@ -16,3 +16,6 @@ dependencies:
   - pip:
     - influxdb-client
     - typing-extensions
+    - fastapi
+    - "uvicorn[standard]"
+    - pydantic
