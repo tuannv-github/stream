@@ -376,6 +376,7 @@ class Video(QWidget):
         self.recording_tee_pad = None  # Store tee pad reference for cleanup
         self.is_recording = False
         self.recording_file_path = None
+        self.last_saved_recording = None
         self.recording_start_time = None  # Track when recording started
         self.auto_record_on_reconnect = False  # Flag to auto-start recording after reconnect
         self.is_stopping_recording = False  # Flag to prevent concurrent stop_recording calls
@@ -1075,12 +1076,12 @@ class Video(QWidget):
         logger.debug(f"stop_recording called: is_recording={self.is_recording}, is_stopping_recording={self.is_stopping_recording}, file_path={self.recording_file_path}")
         if not self.is_recording:
             logger.warning("Recording is not active, ignoring stop_recording request")
-            return
+            return None
         
         # Prevent concurrent calls to stop_recording
         if self.is_stopping_recording:
             logger.warning("Recording is already being stopped, ignoring duplicate stop_recording request")
-            return
+            return None
         
         self.is_stopping_recording = True
         
@@ -1265,10 +1266,15 @@ class Video(QWidget):
                 file_size = os.path.getsize(saved_path)
                 if file_size > 0:
                     logger.info(f"✅ Recording file saved successfully: {saved_path} ({file_size} bytes)")
+                    self.last_saved_recording = saved_path
+                    return saved_path
                 else:
                     logger.warning(f"⚠️ Warning: Recording file is empty: {saved_path}")
+                    self.last_saved_recording = saved_path
+                    return saved_path
             else:
                 logger.error(f"❌ Error: Recording file not found: {saved_path}")
+                return None
             
         except Exception as e:
             logger.error(f"Error stopping recording: {e}", exc_info=True)
@@ -1276,6 +1282,7 @@ class Video(QWidget):
             self.is_recording = False
             self.is_stopping_recording = False  # Clear stopping flag
             self.sig_recording_changed.emit("stopped")
+            return None
     
     def _auto_start_recording_after_reconnect(self):
         """Helper method to auto-start recording after reconnect if it was enabled before disconnect."""
@@ -2050,6 +2057,8 @@ class Player(QWidget):
             idx = 0
         item = self.urls_list[idx] if self.urls_list else {"name": "", "url": ""}
         state = getattr(self.widgetVideo, "state", VideoState.STATE_CLOSE)
+        rec_path = getattr(self.widgetVideo, "recording_file_path", None)
+        last_saved = getattr(self.widgetVideo, "last_saved_recording", None)
         return {
             "state": state.name if hasattr(state, "name") else str(state),
             "recording": bool(getattr(self.widgetVideo, "is_recording", False)),
@@ -2060,6 +2069,8 @@ class Player(QWidget):
             "fps": float(getattr(self, "moving_average_fps", 0.0) or 0.0),
             "bitrate_mbps": float(self.widgetVideo.get_bitrate_mbps()) if hasattr(self.widgetVideo, "get_bitrate_mbps") else 0.0,
             "topics": self.api_list_topics(),
+            "recording_file": os.path.basename(rec_path) if rec_path else None,
+            "last_saved_file": os.path.basename(last_saved) if last_saved else None,
         }
 
     def api_add_topic(self, name, url):
@@ -2141,20 +2152,66 @@ class Player(QWidget):
         if self.widgetVideo.is_recording:
             raise ValueError("Already recording")
         if path:
-            self.widgetVideo.start_recording(path)
+            ok = self.widgetVideo.start_recording(path)
         else:
-            self.widgetVideo.start_recording()
-        return {"message": "Recording started"}
+            ok = self.widgetVideo.start_recording()
+        if ok is False:
+            raise ValueError("Failed to start recording")
+        rec_path = self.widgetVideo.recording_file_path
+        return {
+            "message": "Recording started",
+            "file": os.path.basename(rec_path) if rec_path else None,
+        }
 
     def api_record_stop(self):
-        if not self.widgetVideo.is_recording:
+        if not self.widgetVideo.is_recording and not self.widgetVideo.is_stopping_recording:
             raise ValueError("Not currently recording")
         self.widgetOpen.pushButton_Record.setText("Saving...")
         self.widgetOpen.pushButton_Record.setStyleSheet("background-color: orange; color: white;")
         self.widgetOpen.pushButton_Record.setEnabled(False)
         QApplication.processEvents()
-        QTimer.singleShot(10, self.widgetVideo.stop_recording)
-        return {"message": "Recording stop requested"}
+        # Block until file is finalized; returns saved path
+        saved_path = self.widgetVideo.stop_recording()
+        if not saved_path:
+            saved_path = getattr(self.widgetVideo, "last_saved_recording", None)
+        if not saved_path:
+            raise ValueError("Recording stop finished but no file was saved")
+        return {
+            "message": "Recording saved",
+            "file": os.path.basename(saved_path),
+        }
+
+    def api_list_recordings(self):
+        recordings_dir = os.path.join(os.path.dirname(__file__), "recordings")
+        os.makedirs(recordings_dir, exist_ok=True)
+        items = []
+        for name in sorted(os.listdir(recordings_dir)):
+            full = os.path.join(recordings_dir, name)
+            if not os.path.isfile(full):
+                continue
+            if not name.lower().endswith((".ts", ".mkv", ".mp4", ".mts", ".m4v", ".avi")):
+                continue
+            st = os.stat(full)
+            items.append({
+                "file": name,
+                "size": st.st_size,
+                "mtime": st.st_mtime,
+            })
+        return items
+
+    def api_recording_path(self, filename):
+        """Resolve a safe absolute path under recordings/ for download."""
+        recordings_dir = os.path.realpath(os.path.join(os.path.dirname(__file__), "recordings"))
+        # basename-only to prevent path traversal
+        safe_name = os.path.basename(filename)
+        if not safe_name or safe_name != filename.replace("\\", "/").split("/")[-1]:
+            raise ValueError("Invalid filename")
+        full = os.path.realpath(os.path.join(recordings_dir, safe_name))
+        if not full.startswith(recordings_dir + os.sep) and full != recordings_dir:
+            raise ValueError("Invalid filename")
+        if not os.path.isfile(full):
+            raise FileNotFoundError(f"Recording not found: {safe_name}")
+        return full
 
     def api_publish_start(self):
         if self.is_publishing_continuous:

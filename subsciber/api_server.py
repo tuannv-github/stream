@@ -9,12 +9,15 @@ onto the Qt GUI thread via StreamControlBridge.
 from __future__ import annotations
 
 import logging
+import mimetypes
+import os
 import threading
 from concurrent.futures import Future
-from typing import Any, Dict, List, Optional
+from typing import Any, List, Optional
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from PyQt5.QtCore import QObject, pyqtSignal
 
@@ -22,6 +25,7 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_API_HOST = "0.0.0.0"
 DEFAULT_API_PORT = 8081
+RECORDINGS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "recordings")
 
 
 # ---------------------------------------------------------------------------
@@ -53,6 +57,12 @@ class RecordStartRequest(BaseModel):
     path: Optional[str] = Field(None, description="Optional output file path")
 
 
+class RecordingItem(BaseModel):
+    file: str
+    size: int
+    mtime: float
+
+
 class StatusResponse(BaseModel):
     state: str
     recording: bool
@@ -63,11 +73,14 @@ class StatusResponse(BaseModel):
     fps: float
     bitrate_mbps: float
     topics: List[TopicItem]
+    recording_file: Optional[str] = None
+    last_saved_file: Optional[str] = None
 
 
 class ActionResponse(BaseModel):
     ok: bool
     message: str
+    file: Optional[str] = Field(None, description="Saved recording basename (when applicable)")
     status: Optional[StatusResponse] = None
 
 
@@ -128,6 +141,12 @@ class StreamControlBridge(QObject):
     def _do_record_stop(self) -> dict:
         return self._player.api_record_stop()
 
+    def _do_list_recordings(self) -> list:
+        return self._player.api_list_recordings()
+
+    def _do_recording_path(self, filename: str) -> str:
+        return self._player.api_recording_path(filename)
+
     def _do_publish_start(self) -> dict:
         return self._player.api_publish_start()
 
@@ -139,12 +158,13 @@ class StreamControlBridge(QObject):
 # FastAPI app factory
 # ---------------------------------------------------------------------------
 
-def create_app(bridge: StreamControlBridge) -> FastAPI:
+def create_app(bridge: StreamControlBridge, recordings_dir: str = RECORDINGS_DIR) -> FastAPI:
     app = FastAPI(
         title="Stream Subscriber Control API",
         description=(
             "REST API for controlling the stream subscriber: "
-            "open/close stream, record, publish metrics to InfluxDB, and topic selection."
+            "open/close stream, record, download recordings, publish metrics to InfluxDB, "
+            "and topic selection."
         ),
         version="1.0.0",
         docs_url="/docs",
@@ -159,13 +179,24 @@ def create_app(bridge: StreamControlBridge) -> FastAPI:
         allow_headers=["*"],
     )
 
-    def _call(action: str, **params) -> Any:
+    def _call(action: str, timeout: float = 30.0, **params) -> Any:
         try:
-            return bridge.call(action, **params)
+            return bridge.call(action, timeout=timeout, **params)
         except TimeoutError as exc:
             raise HTTPException(status_code=504, detail=f"Control timed out: {exc}") from exc
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
         except Exception as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    def _action_response(result: dict, default_message: str) -> ActionResponse:
+        status = _call("status")
+        return ActionResponse(
+            ok=True,
+            message=result.get("message", default_message),
+            file=result.get("file"),
+            status=status,
+        )
 
     @app.get("/health", tags=["system"])
     def health():
@@ -182,56 +213,68 @@ def create_app(bridge: StreamControlBridge) -> FastAPI:
     @app.post("/api/v1/topics", response_model=ActionResponse, tags=["topics"])
     def add_topic(body: TopicCreate):
         result = _call("add_topic", name=body.name, url=body.url)
-        status = _call("status")
-        return ActionResponse(ok=True, message=result.get("message", "Topic added"), status=status)
+        return _action_response(result, "Topic added")
 
     @app.post("/api/v1/topics/select", response_model=ActionResponse, tags=["topics"])
     def select_topic(body: TopicSelect):
         result = _call("select_topic", index=body.index, name=body.name)
-        status = _call("status")
-        return ActionResponse(ok=True, message=result.get("message", "Topic selected"), status=status)
+        return _action_response(result, "Topic selected")
 
     @app.delete("/api/v1/topics/{index}", response_model=ActionResponse, tags=["topics"])
     def remove_topic(index: int):
         result = _call("remove_topic", index=index)
-        status = _call("status")
-        return ActionResponse(ok=True, message=result.get("message", "Topic removed"), status=status)
+        return _action_response(result, "Topic removed")
 
     @app.post("/api/v1/stream/open", response_model=ActionResponse, tags=["stream"])
     def stream_open(body: StreamOpenRequest = StreamOpenRequest()):
         result = _call("open", index=body.index, name=body.name)
-        status = _call("status")
-        return ActionResponse(ok=True, message=result.get("message", "Opening stream"), status=status)
+        return _action_response(result, "Opening stream")
 
     @app.post("/api/v1/stream/close", response_model=ActionResponse, tags=["stream"])
     def stream_close():
         result = _call("close")
-        status = _call("status")
-        return ActionResponse(ok=True, message=result.get("message", "Stream closed"), status=status)
+        return _action_response(result, "Stream closed")
 
     @app.post("/api/v1/record/start", response_model=ActionResponse, tags=["record"])
     def record_start(body: RecordStartRequest = RecordStartRequest()):
         result = _call("record_start", path=body.path)
-        status = _call("status")
-        return ActionResponse(ok=True, message=result.get("message", "Recording started"), status=status)
+        return _action_response(result, "Recording started")
 
     @app.post("/api/v1/record/stop", response_model=ActionResponse, tags=["record"])
     def record_stop():
-        result = _call("record_stop")
-        status = _call("status")
-        return ActionResponse(ok=True, message=result.get("message", "Recording stopped"), status=status)
+        # stop_recording waits for mux finalization (can take several seconds)
+        result = _call("record_stop", timeout=90.0)
+        return _action_response(result, "Recording saved")
+
+    @app.get("/api/v1/recordings", response_model=List[RecordingItem], tags=["record"])
+    def list_recordings():
+        return _call("list_recordings")
+
+    @app.get("/api/v1/recordings/{filename}", tags=["record"])
+    def download_recording(filename: str):
+        """Download a saved recording by filename (basename only)."""
+        path = _call("recording_path", filename=filename)
+        media_type, _ = mimetypes.guess_type(path)
+        # Python's mimetypes often mis-labels .ts (Qt linguist); MPEG-TS recordings need video/mp2t
+        if path.lower().endswith((".ts", ".mts", ".m2ts")):
+            media_type = "video/mp2t"
+        elif path.lower().endswith(".mkv"):
+            media_type = "video/x-matroska"
+        return FileResponse(
+            path,
+            media_type=media_type or "application/octet-stream",
+            filename=os.path.basename(path),
+        )
 
     @app.post("/api/v1/publish/start", response_model=ActionResponse, tags=["publish"])
     def publish_start():
         result = _call("publish_start")
-        status = _call("status")
-        return ActionResponse(ok=True, message=result.get("message", "Publishing started"), status=status)
+        return _action_response(result, "Publishing started")
 
     @app.post("/api/v1/publish/stop", response_model=ActionResponse, tags=["publish"])
     def publish_stop():
         result = _call("publish_stop")
-        status = _call("status")
-        return ActionResponse(ok=True, message=result.get("message", "Publishing stopped"), status=status)
+        return _action_response(result, "Publishing stopped")
 
     return app
 
@@ -254,7 +297,7 @@ def iter_local_ipv4_addresses():
     except Exception:
         pass
 
-    # Fallback without netifaces: UDP connect trick + hostname lookup + /proc
+    # Fallback without netifaces: UDP connect trick + hostname lookup
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
             s.connect(("8.8.8.8", 80))
@@ -326,7 +369,8 @@ def start_api_server(bridge: StreamControlBridge, host: str = DEFAULT_API_HOST, 
     """Start uvicorn in a daemon thread. Returns the thread."""
     import uvicorn
 
-    app = create_app(bridge)
+    os.makedirs(RECORDINGS_DIR, exist_ok=True)
+    app = create_app(bridge, recordings_dir=RECORDINGS_DIR)
     config = uvicorn.Config(app, host=host, port=port, log_level="info", access_log=True)
     server = uvicorn.Server(config)
 
