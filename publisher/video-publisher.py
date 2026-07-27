@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import sys
 import time
+from datetime import datetime
 from urllib.parse import urlparse
 
 import gi
@@ -28,6 +29,15 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEST_LIST = os.path.join(SCRIPT_DIR, 'dest.list')
 DEST_LIST_DEFAULT = os.path.join(SCRIPT_DIR, 'dest.list.default')
 DEFAULT_DEST_LIST = DEST_LIST  # user-editable list (seeded from dest.list.default)
+
+# Timestamp overlay: textoverlay updated per-frame to true millisecond precision
+TIMESTAMP_FORMAT = '%Y-%m-%d %H:%M:%S.%f'  # truncated to ms in probe
+TIMESTAMP_OVERLAY = (
+    'textoverlay name=tsoverlay '
+    'shaded-background=true shading-value=200 '
+    'font-desc="Sans, 22" halignment=left valignment=top '
+    'color=0xFFFFFF00 text="00:00:00.000"'
+)
 
 # Prefer compressed MJPG at high res (higher fps / less USB bandwidth), then common raw formats.
 FORMAT_PREFERENCE = ['MJPG', 'JPEG', 'YUYV', 'YUY2', 'NV12', 'RGB3', 'BGR3', 'UYVY', 'GREY', 'Y800']
@@ -569,7 +579,7 @@ def check_gstreamer_plugin(plugin_name):
     return registry.find_plugin(plugin_name) is not None
 
 
-def build_gstreamer_pipeline(device, server_ip, server_port, video_format=None, resolution='1280x720', topic='/stream', protocol='rtmp', rtmp_timeout=DEFAULT_RTMP_TIMEOUT):
+def build_gstreamer_pipeline(device, server_ip, server_port, video_format=None, resolution='1280x720', topic='/stream', protocol='rtmp', rtmp_timeout=DEFAULT_RTMP_TIMEOUT, timestamp=True):
     """Build GStreamer pipeline for UDP or RTMP streaming to MediaMTX."""
 
     v4l_format, resolution = detect_input_format(device, video_format, resolution)
@@ -596,21 +606,37 @@ def build_gstreamer_pipeline(device, server_ip, server_port, video_format=None, 
         video_convert = 'videoconvert'
         print("Using software encoder (x264enc)")
 
+    if timestamp:
+        if check_gstreamer_element('textoverlay'):
+            print("Timestamp overlay: YYYY-MM-DD HH:MM:SS.mmm")
+        else:
+            print("Warning: textoverlay not available; timestamp overlay disabled")
+            timestamp = False
+
     pipeline_parts = [
         f'v4l2src device={device} do-timestamp=true',
     ]
     pipeline_parts.extend(build_source_caps(v4l_format, resolution))
 
+    # Draw timestamp in system memory before HW upload/encode
     if video_convert == 'nvvidconv':
+        pipeline_parts.append('! videoconvert')
+        if timestamp:
+            pipeline_parts.append(f'! {TIMESTAMP_OVERLAY}')
         pipeline_parts.append(f'! {video_convert}')
         pipeline_parts.append('! video/x-raw(memory:NVMM),format=NV12')
     elif video_convert == 'vaapipostproc':
-        # Convert to NV12 in system memory first — avoids messy/corrupt color from
-        # feeding UYVY/GREY straight into vaapipostproc on some Intel/UVC devices.
-        pipeline_parts.append('! videoconvert ! video/x-raw,format=NV12')
+        # Convert for drawable overlay, then NV12 for VAAPI
+        pipeline_parts.append('! videoconvert')
+        if timestamp:
+            pipeline_parts.append(f'! {TIMESTAMP_OVERLAY}')
+            pipeline_parts.append('! videoconvert')
+        pipeline_parts.append('! video/x-raw,format=NV12')
         pipeline_parts.append('! vaapipostproc')
     else:
         pipeline_parts.append('! videoconvert')
+        if timestamp:
+            pipeline_parts.append(f'! {TIMESTAMP_OVERLAY}')
 
     if encoder == 'nvv4l2h264enc':
         pipeline_parts.append(f'! {encoder} bitrate=2000000 iframeinterval=30 insert-sps-pps=true insert-vui=true')
@@ -668,6 +694,7 @@ class Streamer:
         self.sink_location = sink_location
         self.pipeline = None
         self.sink = None
+        self._ts_overlay = None
         self.last_bytes = 0
         self.last_time = time.time()
         self.stall_counter = 0
@@ -689,6 +716,16 @@ class Streamer:
             if message.src == self.pipeline:
                 old_state, new_state, pending_state = message.parse_state_changed()
         return True
+
+    def _on_timestamp_buffer(self, pad, info):
+        """Update textoverlay with wall-clock time including milliseconds."""
+        if self._ts_overlay is not None:
+            # %f is microseconds; keep first 3 digits for milliseconds
+            self._ts_overlay.set_property(
+                'text',
+                datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3],
+            )
+        return Gst.PadProbeReturn.OK
 
     def _on_sink_buffer(self, pad, info):
         buf = info.get_buffer()
@@ -743,6 +780,14 @@ class Streamer:
                 sink_pad = self.sink.get_static_pad('sink')
                 if sink_pad is not None:
                     sink_pad.add_probe(Gst.PadProbeType.BUFFER, self._on_sink_buffer)
+            # Millisecond timestamp overlay
+            self._ts_overlay = self.pipeline.get_by_name('tsoverlay')
+            if self._ts_overlay is not None:
+                ts_pad = self._ts_overlay.get_static_pad('video_sink')
+                if ts_pad is None:
+                    ts_pad = self._ts_overlay.get_static_pad('sink')
+                if ts_pad is not None:
+                    ts_pad.add_probe(Gst.PadProbeType.BUFFER, self._on_timestamp_buffer)
         except Exception as e:
             print(f"Failed to create pipeline: {e}")
             return False
@@ -795,6 +840,7 @@ Examples:
     parser.add_argument('-p', '--port', type=int, default=None, help='Default port when dest has none (RTMP: 1935, UDP: 8000)')
     parser.add_argument('--protocol', choices=['udp', 'rtmp'], default='rtmp', help='Default protocol when dest has no scheme')
     parser.add_argument('--timeout', type=int, default=DEFAULT_RTMP_TIMEOUT, help=f'RTMP connection timeout (default: {DEFAULT_RTMP_TIMEOUT}s)')
+    parser.add_argument('--no-timestamp', action='store_true', help='Disable millisecond timestamp overlay')
 
     args = parser.parse_args()
 
@@ -843,7 +889,8 @@ Examples:
 
     pipeline_str, sink_location = build_gstreamer_pipeline(
         source, server, port,
-        args.format, args.resolution, topic, protocol, args.timeout
+        args.format, args.resolution, topic, protocol, args.timeout,
+        timestamp=not args.no_timestamp,
     )
 
     print(f"\nSource: {source}")
