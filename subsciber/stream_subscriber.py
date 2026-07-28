@@ -1737,11 +1737,15 @@ class Open(QWidget):
 
     
     def on_url_changed(self, index):
-        """Save URL index when changed."""
+        """Save URL index when changed; rebind REST API to 14400+dropdown index."""
         settings = load_settings()
         settings["url_index"] = index
         save_settings(settings)
-        
+        mw = self.window()
+        if mw is not None and getattr(mw, "api_manager", None) is not None:
+            # Defer so combo currentText/index are fully updated
+            QTimer.singleShot(0, mw.rebind_api_for_dropdown)
+
 
     def resizeEvent(self, event):
         print(f"Open resized to: {event.size().width()}x{event.size().height()}")
@@ -2332,13 +2336,51 @@ class MainWindow(QMainWindow):
             return
         QTimer.singleShot(timeout_miliseconds, lambda: self.statusBar().clearMessage())
 
+    def show_api_docs_status(self, docs_urls, port=None):
+        if not docs_urls:
+            if port is not None:
+                self.show_status_bar(f"REST API http://127.0.0.1:{port}/docs", 12000)
+            return
+        status_url = next(
+            (u for u in docs_urls if not u.startswith("http://127.0.0.1")),
+            docs_urls[0],
+        )
+        self.show_status_bar(f"REST API {status_url}", 12000)
+
+    def rebind_api_for_dropdown(self):
+        """Restart control API on port 14400 + current dropdown index."""
+        mgr = getattr(self, "api_manager", None)
+        if mgr is None:
+            return
+        try:
+            docs = mgr.restart_for_dropdown()
+            self.show_api_docs_status(docs, mgr.port)
+        except Exception as e:
+            logger.error(f"Failed to rebind control API: {e}")
+            self.show_status_bar(f"API bind failed: {e}", 8000)
+
 if __name__ == '__main__':
     import argparse
-    from api_server import DEFAULT_API_HOST, DEFAULT_API_PORT, StreamControlBridge, start_api_server
+    from api_server import (
+        DEFAULT_API_HOST,
+        DEFAULT_API_PORT_BASE,
+        ApiServerManager,
+    )
 
     parser = argparse.ArgumentParser(description="Stream subscriber with optional REST control API")
     parser.add_argument("--api-host", default=DEFAULT_API_HOST, help=f"REST API bind host (default: {DEFAULT_API_HOST})")
-    parser.add_argument("--api-port", type=int, default=DEFAULT_API_PORT, help=f"REST API port (default: {DEFAULT_API_PORT})")
+    parser.add_argument(
+        "--api-port",
+        type=int,
+        default=None,
+        help=f"Fixed REST API port (default: {DEFAULT_API_PORT_BASE}+dropdown source index)",
+    )
+    parser.add_argument(
+        "--api-source-index",
+        type=int,
+        default=None,
+        help="Initial dropdown source index (also sets API port = 14400+idx unless --api-port)",
+    )
     parser.add_argument("--no-api", action="store_true", help="Disable the REST/Swagger control API")
     args, qt_args = parser.parse_known_args()
 
@@ -2354,23 +2396,30 @@ if __name__ == '__main__':
     # Update the global URLs list
     URLs.clear()
     URLs.extend(settings.get("urls", []))
+
+    # Optional: force initial dropdown selection (port follows that index)
+    if args.api_source_index is not None:
+        source_index = max(0, int(args.api_source_index))
+        if URLs:
+            source_index = min(source_index, len(URLs) - 1)
+        settings["url_index"] = source_index
+        save_settings(settings)
     
     window = MainWindow()
     window.show()
+    window.api_manager = None
 
     if not args.no_api:
         try:
-            bridge = StreamControlBridge(window.player0)
-            _thread, _server, docs_urls = start_api_server(
-                bridge, host=args.api_host, port=args.api_port
+            window.api_manager = ApiServerManager(
+                window.player0,
+                host=args.api_host,
+                fixed_port=args.api_port,
             )
-            # Prefer a LAN IP in the status bar when bound on all interfaces
-            status_url = next(
-                (u for u in docs_urls if not u.startswith("http://127.0.0.1")),
-                docs_urls[0] if docs_urls else f"http://127.0.0.1:{args.api_port}/docs",
-            )
-            window.show_status_bar(f"REST API {status_url}", 12000)
+            docs_urls = window.api_manager.start_for_index()
+            window.show_api_docs_status(docs_urls, window.api_manager.port)
         except Exception as e:
             logger.error(f"Failed to start control API: {e}")
+            window.show_status_bar(f"API bind failed: {e}", 8000)
 
     sys.exit(app.exec_())

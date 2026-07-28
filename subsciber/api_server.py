@@ -11,6 +11,7 @@ from __future__ import annotations
 import logging
 import mimetypes
 import os
+import re
 import threading
 from concurrent.futures import Future
 from typing import Any, List, Optional
@@ -24,7 +25,21 @@ from PyQt5.QtCore import QObject, pyqtSignal
 logger = logging.getLogger(__name__)
 
 DEFAULT_API_HOST = "0.0.0.0"
-DEFAULT_API_PORT = 8081
+DEFAULT_API_PORT_BASE = 14400
+DEFAULT_API_PORT = DEFAULT_API_PORT_BASE  # used when source index is 0
+
+
+def api_port_for_source_index(idx: int) -> int:
+    """REST API port = 14400 + source index in the topic/source list."""
+    try:
+        idx = int(idx)
+    except (TypeError, ValueError):
+        idx = 0
+    if idx < 0:
+        idx = 0
+    return DEFAULT_API_PORT_BASE + idx
+
+
 RECORDINGS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "recordings")
 
 
@@ -365,20 +380,139 @@ def docs_urls_for_bind(host: str, port: int):
     return out
 
 
-def start_api_server(bridge: StreamControlBridge, host: str = DEFAULT_API_HOST, port: int = DEFAULT_API_PORT):
-    """Start uvicorn in a daemon thread. Returns the thread."""
+def _find_listener_pid(port: int) -> Optional[int]:
+    """Best-effort PID of the process listening on TCP port."""
+    try:
+        import subprocess
+        out = subprocess.check_output(
+            ["ss", "-tlnp", f"sport = :{port}"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        )
+        # users:(("python",pid=123,fd=19))
+        m = re.search(r"pid=(\d+)", out)
+        if m:
+            return int(m.group(1))
+    except Exception:
+        pass
+    try:
+        import subprocess
+        out = subprocess.check_output(
+            ["lsof", "-iTCP:%d" % port, "-sTCP:LISTEN", "-t"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        )
+        for line in out.splitlines():
+            line = line.strip()
+            if line.isdigit():
+                return int(line)
+    except Exception:
+        pass
+    return None
+
+
+def _port_available(host: str, port: int) -> bool:
+    import socket
+
+    bind_host = host if host not in ("0.0.0.0", "::", "") else "0.0.0.0"
+    family = socket.AF_INET6 if ":" in bind_host and bind_host != "0.0.0.0" else socket.AF_INET
+    if bind_host == "0.0.0.0":
+        bind_host = ""
+    try:
+        with socket.socket(family, socket.SOCK_STREAM) as sock:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind((bind_host, port))
+        return True
+    except OSError:
+        return False
+
+
+def start_api_server(
+    bridge: StreamControlBridge,
+    host: str = DEFAULT_API_HOST,
+    port: int = DEFAULT_API_PORT,
+    source_index: int = 0,
+    topic_name: str = "",
+):
+    """Start uvicorn in a daemon thread. Returns (thread, server, docs_urls).
+
+    Raises RuntimeError if the port cannot be bound.
+    """
+    import time
     import uvicorn
+
+    if not _port_available(host, port):
+        holder = _find_listener_pid(port)
+        detail = f" (PID {holder})" if holder else ""
+        raise RuntimeError(
+            f"API port {port} already in use{detail}. "
+            f"Select a different topic in the dropdown, or close the other subscriber."
+        )
 
     os.makedirs(RECORDINGS_DIR, exist_ok=True)
     app = create_app(bridge, recordings_dir=RECORDINGS_DIR)
     config = uvicorn.Config(app, host=host, port=port, log_level="info", access_log=True)
     server = uvicorn.Server(config)
+    # Avoid uvicorn installing its own signal handlers in a background thread
+    server.install_signal_handlers = lambda: None  # type: ignore[method-assign]
 
-    thread = threading.Thread(target=server.run, name="subscriber-api", daemon=True)
+    run_error: list = []
+
+    def _run():
+        try:
+            server.run()
+        except Exception as exc:
+            run_error.append(exc)
+            logger.error("API server exited with error: %s", exc)
+
+    thread = threading.Thread(target=_run, name="subscriber-api", daemon=True)
     thread.start()
 
+    # Wait until uvicorn reports started, or fail if bind/startup failed
+    deadline = time.time() + 5.0
+    while time.time() < deadline:
+        if getattr(server, "started", False):
+            break
+        if run_error:
+            raise RuntimeError(f"API server failed to start on {host}:{port}: {run_error[0]}")
+        if not thread.is_alive():
+            holder = _find_listener_pid(port)
+            detail = f" (held by PID {holder})" if holder else ""
+            raise RuntimeError(
+                f"API server failed to bind {host}:{port}{detail}. "
+                "Another process is using this port."
+            )
+        time.sleep(0.05)
+    else:
+        if not getattr(server, "started", False):
+            holder = _find_listener_pid(port)
+            detail = f" (held by PID {holder})" if holder else ""
+            raise RuntimeError(
+                f"Timed out waiting for API bind on {host}:{port}{detail}."
+            )
+
     docs = docs_urls_for_bind(host, port)
+    print_api_links(host, port, source_index, topic_name=topic_name, docs=docs)
+    return thread, server, docs
+
+
+def print_api_links(
+    host: str,
+    port: int,
+    source_index: int,
+    topic_name: str = "",
+    docs: Optional[List[str]] = None,
+) -> List[str]:
+    """Print Swagger /docs URLs for the current API bind (also on dropdown change)."""
+    if docs is None:
+        docs = docs_urls_for_bind(host, port)
+    topic_label = f" ({topic_name})" if topic_name else ""
     print("\n========== Stream Subscriber Control API ==========", flush=True)
+    print(
+        f"Dropdown source index: {source_index}{topic_label}  →  port {port}  "
+        f"(= {DEFAULT_API_PORT_BASE}+{source_index})",
+        flush=True,
+    )
     print(f"Listening on {host}:{port}", flush=True)
     print("Swagger docs:", flush=True)
     for url in docs:
@@ -386,4 +520,101 @@ def start_api_server(bridge: StreamControlBridge, host: str = DEFAULT_API_HOST, 
     print("===================================================\n", flush=True)
     for url in docs:
         logger.info("Swagger UI: %s", url)
-    return thread, server, docs
+    return docs
+
+
+def stop_api_server(server, thread, join_timeout: float = 3.0) -> None:
+    """Ask uvicorn to exit and wait briefly for the thread to finish."""
+    import time
+
+    if server is None:
+        return
+    try:
+        server.should_exit = True
+        if getattr(server, "started", False):
+            server.force_exit = True
+    except Exception as exc:
+        logger.warning("Error signaling API server shutdown: %s", exc)
+    if thread is not None and thread.is_alive():
+        thread.join(timeout=join_timeout)
+        if thread.is_alive():
+            logger.warning("API server thread did not exit within %.1fs", join_timeout)
+    time.sleep(0.2)
+
+
+class ApiServerManager:
+    """Bind REST API to port 14400 + dropdown source index; rebind on selection change."""
+
+    def __init__(self, player, host: str = DEFAULT_API_HOST, fixed_port: Optional[int] = None):
+        from PyQt5.QtWidgets import QComboBox
+
+        self._QComboBox = QComboBox
+        self.player = player
+        self.host = host
+        self.fixed_port = fixed_port
+        self.bridge = StreamControlBridge(player)
+        self.thread = None
+        self.server = None
+        self.source_index = None
+        self.port = None
+        self.docs_urls = []
+
+    def _combo(self):
+        return self.player.widgetOpen.findChild(self._QComboBox, "comboBox_URL")
+
+    def current_dropdown_index(self) -> int:
+        combo = self._combo()
+        if combo is None:
+            return 0
+        return max(0, combo.currentIndex())
+
+    def current_dropdown_name(self) -> str:
+        combo = self._combo()
+        if combo is None:
+            return ""
+        return combo.currentText() or ""
+
+    def start_for_index(self, source_index: Optional[int] = None, *, announce: bool = True):
+        if source_index is None:
+            source_index = self.current_dropdown_index()
+        source_index = max(0, int(source_index))
+        port = self.fixed_port if self.fixed_port is not None else api_port_for_source_index(source_index)
+        topic_name = self.current_dropdown_name()
+
+        if self.server is not None and getattr(self.server, "started", False) and self.port == port:
+            # Same listen port (fixed --api-port, or same dropdown index)
+            self.source_index = source_index
+            if announce:
+                self.docs_urls = print_api_links(
+                    self.host, port, source_index, topic_name=topic_name, docs=self.docs_urls or None
+                )
+            return self.docs_urls
+
+        self.stop()
+        # start_api_server already prints links
+        self.thread, self.server, self.docs_urls = start_api_server(
+            self.bridge,
+            host=self.host,
+            port=port,
+            source_index=source_index,
+            topic_name=topic_name,
+        )
+        self.source_index = source_index
+        self.port = port
+        return self.docs_urls
+
+    def restart_for_dropdown(self):
+        idx = self.current_dropdown_index()
+        name = self.current_dropdown_name()
+        logger.info("Dropdown source changed → index=%s (%s), rebinding API port", idx, name)
+        return self.start_for_index(idx, announce=True)
+
+    def stop(self):
+        if self.server is not None or (self.thread is not None and self.thread.is_alive()):
+            print(f"Stopping API server on port {self.port}...", flush=True)
+        stop_api_server(self.server, self.thread)
+        self.server = None
+        self.thread = None
+        self.port = None
+        self.source_index = None
+        self.docs_urls = []
