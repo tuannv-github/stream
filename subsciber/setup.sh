@@ -45,6 +45,7 @@ conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/ma
 conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r >/dev/null 2>&1 || true
 
 echo "Creating conda environment '$ENV_NAME'..."
+export PYTHONNOUSERSITE=1
 if conda env list | awk '{print $1}' | grep -qx "$ENV_NAME"; then
     conda env update -n "$ENV_NAME" -f "$SCRIPT_DIR/environment.yml" --prune
 else

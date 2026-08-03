@@ -19,3 +19,5 @@ dependencies:
     - fastapi
     - "uvicorn[standard]"
     - pydantic
+    - annotated-doc
+
