@@ -68,6 +68,7 @@ authInternalUsers:
     path:
   - action: playback
     path:
+  - action: api
 
   # Default administrator.
   # This allows to use API, metrics and PPROF without authentication,
@@ -128,7 +129,7 @@ authJWTClaimKey: mediamtx_permissions
 # Global settings -> Control API
 
 # Enable controlling the server through the Control API.
-api: no
+api: yes
 # Address of the Control API listener.
 apiAddress: :9997
 # Enable TLS/HTTPS on the Control API server.
