@@ -1,12 +1,15 @@
+# https://github.com/bluenviron/mediamtx
+# Image tag matches mediamtx.yaml (v1.9). Host networking is required so
+# RTSP UDP (rtpAddress :8000, rtcpAddress :8001) is reachable.
 services:
   mediamtx:
     image: bluenviron/mediamtx:1.9.3
     container_name: mediamtx
+    restart: unless-stopped
     network_mode: host
     volumes:
-      - ./mediamtx.yml:/mediamtx.yml
+      - ./mediamtx.yaml:/mediamtx.yml:ro
     logging:
       options:
         max-size: "1M"
     tty: true
-    restart: always
