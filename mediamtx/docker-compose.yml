@@ -4,7 +4,7 @@
 services:
   mediamtx:
     image: bluenviron/mediamtx:1.9.3
-    container_name: mediamtx
+    container_name: ${MEDIAMTX_CONTAINER_NAME:-mediamtx}
     restart: unless-stopped
     network_mode: host
     volumes:
